@@ -3,12 +3,25 @@ name = "kantan-audio-manager"
 version = "0.1.0"
 edition = "2024"
 description = "Lightweight single-track audio editor for batch exporting voicelines"
+default-run = "kantan-audio-manager"
+
+[features]
+# The headless UI driver, kept out of normal builds. See CLAUDE.md.
+bridge = ["dep:egui_kittest", "dep:egui_system_font_provider", "dep:image", "dep:serde_json"]
+
+[[bin]]
+name = "kantan-bridge"
+required-features = ["bridge"]
 
 [dependencies]
 audioadapter-buffers = "5"
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "system_fonts"] }
 rfd = "0.17"
 rubato = "5"
+egui_kittest = { version = "0.37", features = ["eframe", "wgpu"], optional = true }
+egui_system_font_provider = { version = "0.37", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+serde_json = { version = "1", optional = true }
 symphonia = { version = "0.6", features = ["wav", "pcm", "mp3", "flac", "ogg", "vorbis"] }
 
 # Decoding and resampling are unusably slow without optimized dependencies.

@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
 use eframe::egui::{self, Color32, Key, Modifiers};
-use kantan_audio_manager::import::{self, ImportError, SUPPORTED_EXTENSIONS};
-use kantan_audio_manager::{Document, Project, Source};
 
+use crate::import::{self, ImportError, SUPPORTED_EXTENSIONS};
 use crate::timeline::{Selection, Timeline, format_time};
+use crate::{Document, Project, Source};
 
 const PROJECT_RATE: u32 = 48000;
 const ZOOM_STEP: f64 = 1.5;
@@ -24,6 +24,8 @@ pub struct App {
     timeline: Timeline,
     importing: Option<Receiver<Vec<Imported>>>,
     error: Option<String>,
+    native_dialogs: bool,
+    blocked_dialogs: u32,
 }
 
 impl App {
@@ -35,9 +37,11 @@ impl App {
         let mut app = Self {
             document: Document::new(Project::new(PROJECT_RATE)),
             selection: Selection::default(),
-            timeline: Timeline::new(),
+            timeline: Timeline::default(),
             importing: None,
             error: None,
+            native_dialogs: true,
+            blocked_dialogs: 0,
         };
         if !startup_files.is_empty() {
             app.start_import(ctx, startup_files);
@@ -45,7 +49,43 @@ impl App {
         app
     }
 
+    /// An app driven without a screen. Actions that would open a native dialog
+    /// are counted instead, because a dialog would block with nobody to answer.
+    pub fn headless(ctx: &egui::Context) -> Self {
+        let mut app = Self::new(ctx, Vec::new());
+        app.native_dialogs = false;
+        app
+    }
+
+    pub fn document(&self) -> &Document {
+        &self.document
+    }
+
+    pub fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    pub fn timeline(&self) -> &Timeline {
+        &self.timeline
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn is_importing(&self) -> bool {
+        self.importing.is_some()
+    }
+
+    pub fn blocked_dialogs(&self) -> u32 {
+        self.blocked_dialogs
+    }
+
     fn pick_files(&mut self, ctx: &egui::Context) {
+        if !self.native_dialogs {
+            self.blocked_dialogs += 1;
+            return;
+        }
         let picked = rfd::FileDialog::new()
             .add_filter("Audio", &SUPPORTED_EXTENSIONS)
             .pick_files();
@@ -55,7 +95,7 @@ impl App {
     }
 
     /// Decodes on a worker thread so a large batch doesn't freeze the window.
-    fn start_import(&mut self, ctx: &egui::Context, mut paths: Vec<PathBuf>) {
+    pub fn start_import(&mut self, ctx: &egui::Context, mut paths: Vec<PathBuf>) {
         if self.importing.is_some() {
             self.error = Some("Wait for the current import to finish.".to_owned());
             return;
@@ -196,7 +236,7 @@ impl App {
         });
     }
 
-    fn selection_summary(&self) -> String {
+    pub fn selection_summary(&self) -> String {
         let project = self.document.project();
         let rate = project.sample_rate();
         let clips = project.clips().len();

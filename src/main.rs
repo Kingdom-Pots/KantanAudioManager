@@ -1,12 +1,10 @@
 // Release builds run without a console window behind the app.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod timeline;
-
 use std::path::PathBuf;
 
 use eframe::egui;
+use kantan_audio_manager::app::App;
 
 fn main() -> eframe::Result {
     // Files passed on the command line, such as with "Open with", get imported.
@@ -23,6 +21,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Kantan Audio Manager",
         options,
-        Box::new(|creation| Ok(Box::new(app::App::new(&creation.egui_ctx, files)))),
+        Box::new(|creation| Ok(Box::new(App::new(&creation.egui_ctx, files)))),
     )
 }

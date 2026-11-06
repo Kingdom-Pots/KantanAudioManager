@@ -4,8 +4,9 @@ use eframe::egui::{
     Align2, Color32, CornerRadius, FontId, Modifiers, Painter, Pos2, Rect, Response, Sense,
     Stroke, StrokeKind, Ui, pos2, vec2,
 };
-use kantan_audio_manager::peaks::clip_min_max;
-use kantan_audio_manager::{Clip, ClipId, Frames, Project, TimeRange};
+
+use crate::peaks::clip_min_max;
+use crate::{Clip, ClipId, Frames, Project, TimeRange};
 
 const RULER_HEIGHT: f32 = 24.0;
 const SCROLLBAR_HEIGHT: f32 = 14.0;
@@ -225,17 +226,53 @@ pub struct Timeline {
     /// Lane width from the last frame, for zoom requests made outside it.
     width: f64,
     extent: f64,
+    /// Screen area from the last frame.
+    rect: Rect,
 }
 
-impl Timeline {
-    pub fn new() -> Self {
+impl Default for Timeline {
+    fn default() -> Self {
         Self {
             view: View { scroll: 0.0, frames_per_point: 100.0 },
             drag: Drag::None,
             fit_requested: true,
             width: 1.0,
             extent: 1.0,
+            rect: Rect::NOTHING,
         }
+    }
+}
+
+impl Timeline {
+    pub fn view(&self) -> View {
+        self.view
+    }
+
+    /// Where a clip is on screen as of the last frame. It can be partly or
+    /// entirely outside the lane when zoomed in.
+    pub fn clip_rect(&self, clip: &Clip) -> Rect {
+        Areas::new(self.rect).clip_rect(&self.view, clip)
+    }
+
+    /// A point on the part of a clip's header that is on screen, if any.
+    pub fn clip_header_point(&self, clip: &Clip) -> Option<Pos2> {
+        let lane = Areas::new(self.rect).lane;
+        let rect = self.clip_rect(clip);
+        let left = rect.left().max(lane.left());
+        let right = rect.right().min(lane.right());
+        (left < right).then(|| pos2((left + right) / 2.0, rect.top() + CLIP_HEADER_HEIGHT / 2.0))
+    }
+
+    /// The screen position of a timeline frame, halfway down the waveform lane.
+    pub fn lane_point(&self, frame: f64) -> Pos2 {
+        let lane = Areas::new(self.rect).lane;
+        let x = lane.left() + self.view.offset_of(frame) as f32;
+        pos2(x, lane.top() + lane.height() * 0.6)
+    }
+
+    /// The middle of the scrollbar's thumb as of the last frame.
+    pub fn scrollbar_thumb_center(&self) -> Pos2 {
+        self.scrollbar_thumb(&Areas::new(self.rect)).center()
     }
 
     pub fn request_fit(&mut self) {
@@ -250,6 +287,7 @@ impl Timeline {
     pub fn show(&mut self, ui: &mut Ui, project: &Project, selection: &mut Selection) {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let areas = Areas::new(rect);
+        self.rect = rect;
 
         self.width = areas.lane.width() as f64;
         self.extent = extent(project);
