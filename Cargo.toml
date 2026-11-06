@@ -1,0 +1,7 @@
+[package]
+name = "kantan-audio-manager"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight single-track audio editor for batch exporting voicelines"
+
+[dependencies]
