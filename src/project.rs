@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::peaks::Peaks;
+
 /// A count of, or position in, audio frames at the project sample rate.
 pub type Frames = u64;
 
@@ -56,11 +58,33 @@ impl std::error::Error for EditError {}
 pub struct Source {
     pub channels: u16,
     pub samples: Vec<f32>,
+    peaks: Peaks,
 }
 
 impl Source {
+    /// Validates the audio and builds its waveform data.
+    pub fn new(channels: u16, samples: Vec<f32>) -> Result<Self, EditError> {
+        if channels != 1 && channels != 2 {
+            return Err(EditError::InvalidSource("only mono and stereo are supported"));
+        }
+        if samples.is_empty() {
+            return Err(EditError::InvalidSource("no audio"));
+        }
+        if !samples.len().is_multiple_of(channels as usize) {
+            return Err(EditError::InvalidSource("incomplete final frame"));
+        }
+        let peaks = Peaks::build(&samples, channels as usize);
+        Ok(Self { channels, samples, peaks })
+    }
+
     pub fn frames(&self) -> Frames {
         self.samples.len() as Frames / self.channels as Frames
+    }
+
+    /// The lowest and highest levels in a frame range, across all channels.
+    pub fn min_max(&self, start: Frames, len: Frames) -> (f32, f32) {
+        self.peaks
+            .min_max(&self.samples, self.channels as usize, start as usize, len as usize)
     }
 }
 
@@ -208,19 +232,15 @@ impl Project {
 
     /// Stores audio that is already at the project sample rate.
     pub fn add_source(&mut self, channels: u16, samples: Vec<f32>) -> Result<SourceId, EditError> {
-        if channels != 1 && channels != 2 {
-            return Err(EditError::InvalidSource("only mono and stereo are supported"));
-        }
-        if samples.is_empty() {
-            return Err(EditError::InvalidSource("no audio"));
-        }
-        if !samples.len().is_multiple_of(channels as usize) {
-            return Err(EditError::InvalidSource("incomplete final frame"));
-        }
+        Ok(self.insert_source(Source::new(channels, samples)?))
+    }
+
+    /// Stores a source that has already been built, such as on a worker thread.
+    pub fn insert_source(&mut self, source: Source) -> SourceId {
         let id = SourceId(self.next_source);
         self.next_source += 1;
-        self.sources.insert(id, Arc::new(Source { channels, samples }));
-        Ok(id)
+        self.sources.insert(id, Arc::new(source));
+        id
     }
 
     /// Adds a whole source as a new clip after the last one.

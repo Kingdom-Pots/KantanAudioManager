@@ -6,6 +6,8 @@
 //! those lists and undo snapshots stay cheap.
 
 pub mod history;
+pub mod import;
+pub mod peaks;
 pub mod project;
 pub mod render;
 

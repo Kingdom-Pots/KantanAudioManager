@@ -5,3 +5,12 @@ edition = "2024"
 description = "Lightweight single-track audio editor for batch exporting voicelines"
 
 [dependencies]
+audioadapter-buffers = "5"
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "system_fonts"] }
+rfd = "0.17"
+rubato = "5"
+symphonia = { version = "0.6", features = ["wav", "pcm", "mp3", "flac", "ogg", "vorbis"] }
+
+# Decoding and resampling are unusably slow without optimized dependencies.
+[profile.dev.package."*"]
+opt-level = 2
