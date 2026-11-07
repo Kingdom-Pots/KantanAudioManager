@@ -38,6 +38,8 @@ Commands, one per line. # starts a comment, and \"quotes\" allow spaces.
                              bits 16|24, scope all|selected,
                              numbering off|before|after, start, digits
   export-wait                Wait for a running export to finish
+  advance SECONDS            Pull playing audio as a sound device would;
+                             state then shows the peak heard
   state                      Print the app's state as one line of JSON
   screenshot PATH            Render the window to a PNG file
 
@@ -66,6 +68,7 @@ enum Command {
     Drag(Pos2, Pos2, Modifiers),
     ExportSet(String, String),
     ExportWait,
+    Advance(f64),
     State,
     Screenshot(PathBuf),
 }
@@ -171,6 +174,7 @@ fn parse(line: &str) -> Result<Option<Command>, String> {
         ),
         ("export", [key, value]) => Command::ExportSet(key.clone(), value.clone()),
         ("export-wait", []) => Command::ExportWait,
+        ("advance", [seconds]) => Command::Advance(number(seconds)?),
         ("state", []) => Command::State,
         ("screenshot", [path]) => Command::Screenshot(PathBuf::from(path)),
         (other, _) => return Err(format!("unknown command or wrong arguments: '{other}'")),
@@ -194,6 +198,7 @@ impl egui::DroppedFile for DroppedPath {
 
 struct Bridge {
     harness: Harness<'static, App>,
+    last_peak: f32,
 }
 
 impl Bridge {
@@ -212,7 +217,7 @@ impl Bridge {
             })
             .wgpu()
             .build_eframe(|creation| App::headless(&creation.egui_ctx));
-        Self { harness }
+        Self { harness, last_peak: 0.0 }
     }
 
     /// Runs frames until the app has nothing left to animate.
@@ -384,6 +389,12 @@ impl Bridge {
                 }
                 self.settle();
             }
+            Command::Advance(seconds) => {
+                let frames = (seconds * self.sample_rate()) as usize;
+                self.last_peak = self.harness.state_mut().player_mut().advance(frames);
+                // Playing repaints constantly, so run frames rather than settling.
+                self.harness.run_steps(3);
+            }
             Command::State => println!("{}", self.state()),
             Command::Screenshot(path) => {
                 let image = self.harness.render()?;
@@ -474,6 +485,11 @@ impl Bridge {
         });
 
         json!({
+            "playback": {
+                "playing": app.player().is_playing(),
+                "position": app.player().position().map(seconds),
+                "peak": self.last_peak,
+            },
             "export": {
                 "open": dialog.open,
                 "running": dialog.is_running(),

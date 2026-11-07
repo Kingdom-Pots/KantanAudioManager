@@ -11,6 +11,7 @@ pub mod export_dialog;
 pub mod history;
 pub mod import;
 pub mod peaks;
+pub mod playback;
 pub mod project;
 pub mod render;
 pub mod timeline;

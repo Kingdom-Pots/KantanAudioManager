@@ -310,3 +310,43 @@ fn export_window_owns_the_keyboard_and_escape_closes_it() {
     assert_eq!(states[2]["export"]["open"], false);
     assert!(states[2]["error"].as_str().unwrap().contains("no clips"));
 }
+
+#[test]
+fn space_plays_pauses_and_resumes_from_where_it_stopped() {
+    let samples = Samples::new("play");
+    let states = run(&format!(
+        "{}\ntime 0.5\nkey space\nstate\nadvance 0.25\nstate\nkey space\nstate\nkey space\nstate\n",
+        samples.import_line("import")
+    ));
+    assert_eq!(states[0]["playback"]["playing"], true);
+    let position = states[1]["playback"]["position"].as_f64().unwrap();
+    assert!((position - 0.75).abs() < 0.05, "{position}");
+    assert!((states[1]["playback"]["peak"].as_f64().unwrap() - 0.5).abs() < 0.01);
+    assert_eq!(states[2]["playback"]["playing"], false);
+    assert!((states[2]["cursor"].as_f64().unwrap() - position).abs() < 0.001);
+    assert!((states[3]["playback"]["position"].as_f64().unwrap() - position).abs() < 0.001);
+}
+
+#[test]
+fn playing_a_range_stays_in_it_and_gaps_are_silent() {
+    let samples = Samples::new("playrange");
+    // intro is 0-2s, then a half second gap before line1.
+    let states = run(&format!(
+        "{}\nrange 2.1 2.4\nbutton Play\nadvance 0.1\nstate\nadvance 1\nstate\n",
+        samples.import_line("import")
+    ));
+    assert_eq!(states[0]["playback"]["peak"], 0.0);
+    assert_eq!(states[1]["playback"]["playing"], false, "stops at the range end");
+    assert!(states[1]["range"].is_array());
+}
+
+#[test]
+fn undo_stops_playback_and_an_empty_track_explains_itself() {
+    let samples = Samples::new("playundo");
+    let states = run(&format!(
+        "{}\nkey space\nkey ctrl+z\nstate\nkey space\nstate\n",
+        samples.import_line("import")
+    ));
+    assert_eq!(states[0]["playback"]["playing"], false);
+    assert!(states[1]["error"].as_str().unwrap().contains("nothing to play"));
+}

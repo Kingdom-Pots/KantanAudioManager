@@ -28,6 +28,7 @@ const WAVEFORM: Color32 = Color32::from_rgb(120, 190, 235);
 const WAVEFORM_OVER: Color32 = Color32::from_rgb(235, 90, 80);
 // Premultiplied: white at about 18% opacity.
 const RANGE: Color32 = Color32::from_rgba_premultiplied(45, 45, 45, 45);
+const PLAYHEAD: Color32 = Color32::from_rgb(110, 225, 130);
 const CURSOR: Color32 = Color32::from_rgb(245, 245, 245);
 const SCROLL_TRACK: Color32 = Color32::from_rgb(34, 37, 43);
 const SCROLL_THUMB: Color32 = Color32::from_rgb(85, 92, 104);
@@ -284,7 +285,13 @@ impl Timeline {
         self.view.zoom(factor, self.width / 2.0, self.width, self.extent);
     }
 
-    pub fn show(&mut self, ui: &mut Ui, project: &Project, selection: &mut Selection) {
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        project: &Project,
+        selection: &mut Selection,
+        playhead: Option<Frames>,
+    ) {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let areas = Areas::new(rect);
         self.rect = rect;
@@ -297,6 +304,9 @@ impl Timeline {
         self.handle_zoom_and_scroll(ui, &response, &areas);
         self.view.clamp(self.width, self.extent);
         self.handle_pointer(ui, &response, &areas, project, selection);
+        if let Some(playhead) = playhead {
+            self.follow(playhead as f64);
+        }
         self.view.clamp(self.width, self.extent);
 
         let painter = ui.painter_at(rect);
@@ -306,7 +316,21 @@ impl Timeline {
         }
         self.paint_selection(&painter, &areas, selection);
         self.paint_ruler(&painter, &areas, project.sample_rate());
+        if let Some(playhead) = playhead {
+            let x = areas.lane.left() + self.view.offset_of(playhead as f64) as f32;
+            painter.line_segment(
+                [pos2(x, areas.ruler.top()), pos2(x, areas.lane.bottom())],
+                Stroke::new(1.5, PLAYHEAD),
+            );
+        }
         self.paint_scrollbar(&painter, &areas);
+    }
+
+    /// Turns the page when the playhead leaves the view.
+    fn follow(&mut self, frame: f64) {
+        if frame < self.view.scroll || frame > self.view.frame_at(self.width) {
+            self.view.scroll = frame;
+        }
     }
 
     fn handle_zoom_and_scroll(&mut self, ui: &Ui, response: &Response, areas: &Areas) {

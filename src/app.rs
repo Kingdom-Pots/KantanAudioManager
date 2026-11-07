@@ -7,6 +7,7 @@ use eframe::egui::{self, Color32, Key, Modifiers};
 
 use crate::export_dialog::ExportDialog;
 use crate::import::{self, ImportError, SUPPORTED_EXTENSIONS};
+use crate::playback::Player;
 use crate::timeline::{Selection, Timeline, format_time};
 use crate::{Document, Project, Source};
 
@@ -28,6 +29,9 @@ pub struct App {
     native_dialogs: bool,
     blocked_dialogs: u32,
     export: ExportDialog,
+    player: Player,
+    /// The document revision being played, to stop if the project changes.
+    played_revision: u64,
 }
 
 impl App {
@@ -45,6 +49,8 @@ impl App {
             native_dialogs: true,
             blocked_dialogs: 0,
             export: ExportDialog::default(),
+            player: Player::new(true),
+            played_revision: 0,
         };
         if !startup_files.is_empty() {
             app.start_import(ctx, startup_files);
@@ -57,6 +63,7 @@ impl App {
     pub fn headless(ctx: &egui::Context) -> Self {
         let mut app = Self::new(ctx, Vec::new());
         app.native_dialogs = false;
+        app.player = Player::new(false);
         app
     }
 
@@ -86,6 +93,53 @@ impl App {
 
     pub fn export_dialog_mut(&mut self) -> &mut ExportDialog {
         &mut self.export
+    }
+
+    pub fn player(&self) -> &Player {
+        &self.player
+    }
+
+    pub fn player_mut(&mut self) -> &mut Player {
+        &mut self.player
+    }
+
+    /// Pausing leaves the cursor where it stopped, so Space resumes from there.
+    /// A range always plays from its start.
+    fn toggle_playback(&mut self) {
+        if self.player.is_playing() {
+            let reached = self.player.stop();
+            if let (Some(reached), None) = (reached, self.selection.range) {
+                self.selection.cursor = reached;
+            }
+            return;
+        }
+        let project = self.document.project();
+        let Some(track_end) = project.clips().last().map(|clip| clip.end()) else {
+            self.error = Some("There is nothing to play.".to_owned());
+            return;
+        };
+        let (from, to) = match self.selection.range {
+            Some(range) => (range.start, range.end),
+            // Starting past the end would be silent, so go back to the start.
+            None if self.selection.cursor >= track_end => (0, track_end),
+            None => (self.selection.cursor, track_end),
+        };
+        match self.player.start(project, from, to) {
+            Ok(()) => self.played_revision = self.document.revision(),
+            Err(error) => self.error = Some(format!("Couldn't play: {error}")),
+        }
+    }
+
+    /// Ends playback once it finishes, or if the audio no longer matches the project.
+    fn update_playback(&mut self, ctx: &egui::Context) {
+        if !self.player.is_playing() {
+            return;
+        }
+        if self.player.has_finished() || self.played_revision != self.document.revision() {
+            self.player.stop();
+        } else {
+            ctx.request_repaint();
+        }
     }
 
     fn open_export(&mut self) {
@@ -193,6 +247,9 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z)) {
             self.document.undo();
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space)) {
+            self.toggle_playback();
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::E)) {
             self.open_export();
         }
@@ -215,6 +272,12 @@ impl App {
             }
             if ui.button("Export").on_hover_text("Export clips to files (Ctrl+E)").clicked() {
                 self.open_export();
+            }
+            ui.separator();
+
+            let label = if self.player.is_playing() { "Pause" } else { "Play" };
+            if ui.button(label).on_hover_text("Play or pause (Space)").clicked() {
+                self.toggle_playback();
             }
             ui.separator();
 
@@ -310,6 +373,7 @@ impl eframe::App for App {
             self.handle_dropped_files(&ctx);
             self.handle_hotkeys(&ctx);
         }
+        self.update_playback(&ctx);
         self.selection.retain_existing(self.document.project());
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
@@ -318,7 +382,8 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
-                self.timeline.show(ui, self.document.project(), &mut self.selection);
+                let playhead = self.player.position();
+                self.timeline.show(ui, self.document.project(), &mut self.selection, playhead);
                 self.paint_overlay(&ctx, rect, ui.painter());
             });
         self.export.show(

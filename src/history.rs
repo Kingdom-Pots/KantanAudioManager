@@ -13,11 +13,17 @@ pub struct Document {
     project: Project,
     undo: Vec<Entry>,
     redo: Vec<Entry>,
+    revision: u64,
 }
 
 impl Document {
     pub fn new(project: Project) -> Self {
-        Self { project, undo: Vec::new(), redo: Vec::new() }
+        Self { project, undo: Vec::new(), redo: Vec::new(), revision: 0 }
+    }
+
+    /// Changes whenever the project does, through an edit, undo or redo.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn project(&self) -> &Project {
@@ -36,6 +42,7 @@ impl Document {
         let project = std::mem::replace(&mut self.project, next);
         self.undo.push(Entry { label, project });
         self.redo.clear();
+        self.revision += 1;
         Ok(result)
     }
 
@@ -44,6 +51,7 @@ impl Document {
         let entry = self.undo.pop()?;
         let project = std::mem::replace(&mut self.project, entry.project);
         self.redo.push(Entry { label: entry.label, project });
+        self.revision += 1;
         Some(entry.label)
     }
 
@@ -52,6 +60,7 @@ impl Document {
         let entry = self.redo.pop()?;
         let project = std::mem::replace(&mut self.project, entry.project);
         self.undo.push(Entry { label: entry.label, project });
+        self.revision += 1;
         Some(entry.label)
     }
 
