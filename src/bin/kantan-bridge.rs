@@ -31,7 +31,12 @@ Commands, one per line. # starts a comment, and \"quotes\" allow spaces.
   range FROM TO              Drag a range selection between two times, in seconds
   zoom SECONDS NOTCHES       Ctrl+Scroll at a time; positive notches zoom in
   pan NOTCHES                Scroll the wheel; positive notches move later in time
-  scrollbar POINTS           Drag the scrollbar thumb sideways
+  scrollbar POINTS           Drag the overview's window sideways
+  overview-click SECONDS     Click the overview at a time
+  overview-edge left|right POINTS
+                             Drag one edge of the overview's window
+  menu-overview              Right-click the overview for its settings
+  track-view SECONDS HEIGHT  Set the visible range and clip height
   click X Y [MODS]           Click at a position, in points
   drag X1 Y1 X2 Y2 [MODS]    Drag between positions, in points
   export KEY VALUE           Set an option in the open export window:
@@ -86,6 +91,10 @@ enum Command {
     Zoom(f64, f32),
     Pan(f32),
     Scrollbar(f32),
+    OverviewClick(f64),
+    OverviewEdge(bool, f32),
+    MenuOverview,
+    TrackView(f32, f32),
     Click(Pos2, Modifiers),
     Drag(Pos2, Pos2, Modifiers),
     ExportSet(String, String),
@@ -207,6 +216,14 @@ fn parse(line: &str) -> Result<Option<Command>, String> {
         ("zoom", [seconds, notches]) => Command::Zoom(number(seconds)?, number(notches)?),
         ("pan", [notches]) => Command::Pan(number(notches)?),
         ("scrollbar", [points]) => Command::Scrollbar(number(points)?),
+        ("overview-click", [seconds]) => Command::OverviewClick(number(seconds)?),
+        ("overview-edge", [side, points]) => match side.as_str() {
+            "left" => Command::OverviewEdge(true, number(points)?),
+            "right" => Command::OverviewEdge(false, number(points)?),
+            _ => return Err(format!("overview-edge needs left or right, not '{side}'")),
+        },
+        ("menu-overview", []) => Command::MenuOverview,
+        ("track-view", [seconds, height]) => Command::TrackView(number(seconds)?, number(height)?),
         ("click", [x, y, rest @ ..]) if rest.len() <= 1 => {
             Command::Click(pos2(number(x)?, number(y)?), optional_mods(rest.first())?)
         }
@@ -506,8 +523,25 @@ impl Bridge {
                 self.wheel(point, -notches, Modifiers::NONE);
             }
             Command::Scrollbar(points) => {
-                let thumb = self.harness.state().timeline().scrollbar_thumb_center();
-                self.drag(thumb, thumb + vec2(points, 0.0), Modifiers::NONE);
+                let window = self.harness.state().timeline().overview_window_center();
+                self.drag(window, window + vec2(points, 0.0), Modifiers::NONE);
+            }
+            Command::OverviewClick(seconds) => {
+                let point = self.harness.state().timeline().overview_point(seconds * self.sample_rate());
+                self.click(point, Modifiers::NONE);
+            }
+            Command::OverviewEdge(left, points) => {
+                let edge = self.harness.state().timeline().overview_edge_point(left);
+                self.drag(edge, edge + vec2(points, 0.0), Modifiers::NONE);
+            }
+            Command::MenuOverview => {
+                let point = self.harness.state().timeline().overview_window_center();
+                self.secondary_click(point);
+            }
+            Command::TrackView(visible_seconds, clip_height) => {
+                let settings = kantan_audio_manager::timeline::TrackSettings { visible_seconds, clip_height };
+                self.harness.state_mut().timeline_mut().set_settings(settings);
+                self.settle();
             }
             Command::Click(pos, modifiers) => self.click(pos, modifiers),
             Command::Drag(from, to, modifiers) => self.drag(from, to, modifiers),
@@ -744,7 +778,14 @@ impl Bridge {
             "importing": app.is_importing(),
             "undo": app.document().undo_label(),
             "redo": app.document().redo_label(),
-            "view": { "from": view.scroll / rate, "frames_per_point": view.frames_per_point },
+            "view": {
+                "from": view.scroll / rate,
+                "frames_per_point": view.frames_per_point,
+                "visible_seconds": app.timeline().visible_seconds(),
+                "lane_height": app.timeline().lane_height(),
+                "overview_shown": app.timeline().overview_shown(),
+                "settings": [app.timeline().settings.visible_seconds, app.timeline().settings.clip_height],
+            },
             "blocked_dialogs": app.blocked_dialogs(),
         })
     }

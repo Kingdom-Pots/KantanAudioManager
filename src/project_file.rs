@@ -33,6 +33,22 @@ pub fn save(path: &Path, project: &Project, settings: &Settings) -> Result<(), S
 
 fn write_file(path: &Path, project: &Project, settings: &Settings) -> std::io::Result<()> {
     let mut out = BufWriter::new(std::fs::File::create(path)?);
+    write_to(&mut out, project, settings)
+}
+
+/// The project as file contents, for the browser version to download.
+pub fn to_bytes(project: &Project, settings: &Settings) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_to(&mut out, project, settings).expect("writing to memory can't fail");
+    out
+}
+
+/// Reads a project from file contents, as uploaded in the browser version.
+pub fn load_bytes(bytes: &[u8]) -> Result<(Project, Settings), String> {
+    parse(bytes).ok_or_else(|| "not a Kantan project, or the file is damaged".to_owned())
+}
+
+fn write_to(mut out: &mut impl Write, project: &Project, settings: &Settings) -> std::io::Result<()> {
     out.write_all(MAGIC)?;
     let (next_source, next_clip) = project.next_ids();
     write_u32(&mut out, project.sample_rate())?;

@@ -1,3 +1,5 @@
 /target
 /dist
 /.cargo/config.toml
+/CLAUDE.md
+/dist-web

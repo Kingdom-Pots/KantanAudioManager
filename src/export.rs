@@ -1,6 +1,8 @@
 //! Turns clips into WAV files: working out filenames, then writing them.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
 use crate::import::resample;
@@ -164,6 +166,7 @@ pub enum ExistingFiles {
     KeepBoth,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Writes one WAV per clip. `progress` is called after each file with the number done.
 pub fn export_clips(
     project: &Project,
@@ -175,6 +178,7 @@ pub fn export_clips(
     export_clips_with_policy(project, files, sample_rate, format, ExistingFiles::Replace, progress)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Publishes complete files using the conflict choice made for this batch.
 pub fn export_clips_with_policy(
     project: &Project,
@@ -204,6 +208,7 @@ pub fn export_clips_with_policy(
     report
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Returns whether the audio had to be limited to full scale.
 fn write_clip(
     project: &Project,
@@ -241,6 +246,7 @@ fn write_clip(
     Ok((samples.iter().any(|s| s.abs() > 1.0), published))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn publish_file(
     mut temp: tempfile::TempPath,
     path: &Path,
@@ -273,6 +279,7 @@ fn publish_file(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn write_wav(
     path: &Path,
     samples: &[f32],
@@ -306,6 +313,7 @@ fn write_wav(
     writer.finalize().map_err(error)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn write_mp3(path: &Path, samples: &[f32], channels: u16, sample_rate: u32) -> Result<(), String> {
     use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, MonoPcm};
 
@@ -337,6 +345,7 @@ fn write_mp3(path: &Path, samples: &[f32], channels: u16, sample_rate: u32) -> R
     std::fs::write(path, output).map_err(|e| e.to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn write_ogg(path: &Path, samples: &[f32], channels: u16, sample_rate: u32) -> Result<(), String> {
     use std::num::{NonZeroU8, NonZeroU32};
     use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoderBuilder};
@@ -362,6 +371,44 @@ fn write_ogg(path: &Path, samples: &[f32], channels: u16, sample_rate: u32) -> R
     }
     encoder.finish().map_err(error)?;
     Ok(())
+}
+
+/// Renders, resamples and encodes one clip in memory, for the browser version,
+/// which has no folders to write to. Returns the file and whether it clipped.
+pub fn encode_clip(
+    project: &Project,
+    id: ClipId,
+    sample_rate: u32,
+    format: OutputFormat,
+) -> Result<(Vec<u8>, bool), String> {
+    let OutputFormat::Wav(depth) = format else {
+        return Err("only WAV can be exported in the browser".to_owned());
+    };
+    let clip = project.clip(id).ok_or("the clip no longer exists")?;
+    let rendered = render_clip(project, clip);
+    let samples = resample(&rendered.samples, rendered.channels as usize, project.sample_rate(), sample_rate)
+        .map_err(|e| e.to_string())?;
+    let spec = hound::WavSpec {
+        channels: rendered.channels,
+        sample_rate,
+        bits_per_sample: match depth {
+            BitDepth::Bits16 => 16,
+            BitDepth::Bits24 => 24,
+        },
+        sample_format: hound::SampleFormat::Int,
+    };
+    let error = |e: hound::Error| e.to_string();
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    let mut writer = hound::WavWriter::new(&mut bytes, spec).map_err(error)?;
+    for &sample in &samples {
+        let sample = sample.clamp(-1.0, 1.0);
+        match depth {
+            BitDepth::Bits16 => writer.write_sample((sample * i16::MAX as f32).round() as i16).map_err(error)?,
+            BitDepth::Bits24 => writer.write_sample((sample as f64 * 8_388_607.0).round() as i32).map_err(error)?,
+        }
+    }
+    writer.finalize().map_err(error)?;
+    Ok((bytes.into_inner(), samples.iter().any(|s| s.abs() > 1.0)))
 }
 
 #[cfg(test)]

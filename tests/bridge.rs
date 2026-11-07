@@ -852,7 +852,7 @@ fn every_toolbar_button_has_an_explaining_tooltip() {
         ("Redo", "Nothing to redo"),
         ("-", "Zoom out"),
         ("+", "Zoom in"),
-        ("Fit", "whole track"),
+        ("Fit", "whole project"),
     ]
     .map(|(label, tip)| format!("expect-tip \"{label}\" \"{tip}\"\n"))
     .concat();
@@ -984,4 +984,95 @@ fn conflict_cancel_and_copies_preserve_existing_exports() {
     assert_eq!(std::fs::read(out.join("intro.wav")).unwrap(), b"original");
     assert_eq!(std::fs::read(out.join("intro (2).wav")).unwrap(), b"existing copy");
     assert!(hound::WavReader::open(out.join("intro (3).wav")).is_ok());
+}
+
+#[test]
+fn clips_stop_growing_at_the_height_cap_however_tall_the_window() {
+    let samples = Samples::new("tall");
+    let states = run(&format!(
+        "size 1100 420\n{}\nstate\nsize 1100 900\nstate\ntrack-view 20 300\nstate\n",
+        samples.import_line("import")
+    ));
+    let height = |state: &Value| {
+        let rect = &state["clips"][0]["rect"];
+        rect[3].as_f64().unwrap() - rect[1].as_f64().unwrap()
+    };
+    assert!(height(&states[0]) <= 180.5, "{}", height(&states[0]));
+    assert_eq!(height(&states[1]), 180.0, "a tall window doesn't stretch clips");
+    assert_eq!(height(&states[2]), 300.0);
+}
+
+#[test]
+fn imports_and_takes_keep_the_zoom_and_scroll_into_view() {
+    let samples = Samples::new("keepzoom");
+    let states = run(&format!(
+        "{}\ntrack-view 3 180\nstate\n{}\nstate\n",
+        samples.import_line("import"),
+        samples.import_line("import"),
+    ));
+    let visible = |i: usize| states[i]["view"]["visible_seconds"].as_f64().unwrap();
+    assert!((visible(0) - 3.0).abs() < 0.01);
+    assert!((visible(1) - 3.0).abs() < 0.01, "no refit to squeeze everything in");
+    let from = states[1]["view"]["from"].as_f64().unwrap();
+    let new_start = states[1]["clips"][4]["start"].as_f64().unwrap();
+    assert!(from <= new_start && new_start < from + 3.0, "the new clips are on screen");
+}
+
+#[test]
+fn the_overview_moves_and_resizes_the_visible_region() {
+    let samples = Samples::new("overview");
+    let states = run(&format!(
+        "{}\n{}\ntrack-view 4 180\nstate\noverview-click 10\nstate\nscrollbar 100\nstate\noverview-edge right 120\nstate\noverview-edge left -40\nstate\n",
+        samples.import_line("import"),
+        samples.import_line("import"),
+    ));
+    let from = |i: usize| states[i]["view"]["from"].as_f64().unwrap();
+    let visible = |i: usize| states[i]["view"]["visible_seconds"].as_f64().unwrap();
+    assert!((from(1) + visible(1) / 2.0 - 10.0).abs() < 0.2, "click centres on that time");
+    assert!(from(2) > from(1), "dragging the window scrolls forward");
+    assert!((visible(2) - visible(1)).abs() < 0.01, "without zooming");
+    assert!(visible(3) > visible(2), "the right edge shows more");
+    assert!((from(3) - from(2)).abs() < 0.01, "and keeps the left edge");
+    assert!(from(4) < from(3) && visible(4) > visible(3), "the left edge moves the start");
+    assert!((states[4]["view"]["settings"][0].as_f64().unwrap() - visible(4)).abs() < 0.05);
+}
+
+#[test]
+fn view_settings_open_from_the_overview_and_persist() {
+    let samples = Samples::new("prefs");
+    let data = samples.0.join("data");
+    let first = parse_states(&run_with_data(
+        &format!("{}\nmenu-overview\nexpect-text \"Visible range\"\nexpect-text \"Clip height\"\ntrack-view 8 250\nstate\n", samples.import_line("import")),
+        Some(&data),
+    ));
+    assert_eq!(first[0]["view"]["settings"], serde_json::json!([8.0, 250.0]));
+    let second = parse_states(&run_with_data("state\n", Some(&data)));
+    assert_eq!(second[0]["view"]["settings"], serde_json::json!([8.0, 250.0]), "remembered next time");
+    assert!((second[0]["view"]["visible_seconds"].as_f64().unwrap() - 8.0).abs() < 0.01);
+}
+
+#[test]
+fn a_new_short_project_still_opens_at_the_visible_range() {
+    let samples = Samples::new("shortstart");
+    let states = run(&format!("state
+import {}
+state
+", samples.path("line1.wav")));
+    for state in &states {
+        assert!((state["view"]["visible_seconds"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    }
+}
+
+#[test]
+fn the_overview_appears_once_there_is_something_in_the_project() {
+    let samples = Samples::new("emptyoverview");
+    let states = run(&format!("state
+import {}
+state
+key ctrl+z
+state
+", samples.path("line1.wav")));
+    assert_eq!(states[0]["view"]["overview_shown"], false, "an empty project has no overview");
+    assert_eq!(states[1]["view"]["overview_shown"], true);
+    assert_eq!(states[2]["view"]["overview_shown"], false);
 }

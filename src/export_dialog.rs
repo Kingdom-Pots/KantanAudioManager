@@ -1,14 +1,17 @@
 //! The export window: options, a live filename preview, and the running job.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 
 use eframe::egui::{self, Color32, RichText};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::export::export_clips_with_policy;
 use crate::export::{
     BitDepth, ExportReport, FileProblem, NameOptions, NumberPosition, Numbering, OutputFormat,
     PlannedFile,
-    ExistingFiles, export_clips_with_policy, plan_files,
+    ExistingFiles, plan_files,
 };
 use crate::project_file::Settings;
 use crate::{ClipId, Project};
@@ -227,7 +230,7 @@ impl ExportDialog {
     fn can_start(&self, plan: &[PlannedFile]) -> bool {
         self.job.is_none()
             && self.pending.is_none()
-            && self.settings.folder.is_some()
+            && (self.settings.folder.is_some() || cfg!(target_arch = "wasm32"))
             && !plan.is_empty()
             && !plan.iter().any(|file| file.problem == Some(FileProblem::Duplicate))
     }
@@ -236,6 +239,46 @@ impl ExportDialog {
         self.pending.is_some()
     }
 
+    /// The browser version packs every file into one ZIP and downloads it.
+    #[cfg(target_arch = "wasm32")]
+    fn request_export(&mut self, _ctx: &egui::Context, project: &Project, selected: &[ClipId], plan: &[PlannedFile]) {
+        use std::io::Write;
+        let format = self.settings.output_format();
+        let mut report = ExportReport::default();
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (clip, file) in self.clips(project, selected).iter().zip(plan) {
+            match crate::export::encode_clip(project, clip.id, self.settings.sample_rate, format) {
+                Ok((bytes, clipped)) => {
+                    let added = archive
+                        .start_file(file.file_name.as_str(), options)
+                        .map_err(|e| e.to_string())
+                        .and_then(|()| archive.write_all(&bytes).map_err(|e| e.to_string()));
+                    match added {
+                        Ok(()) => {
+                            report.written += 1;
+                            if clipped {
+                                report.clipped.push(file.file_name.clone());
+                            }
+                        }
+                        Err(error) => report.failed.push(format!("{}: {error}", file.file_name)),
+                    }
+                }
+                Err(error) => report.failed.push(format!("{}: {error}", file.file_name)),
+            }
+        }
+        let downloaded = archive
+            .finish()
+            .map_err(|e| e.to_string())
+            .and_then(|zip| crate::web::download("Kantan export.zip", &zip.into_inner()));
+        if let Err(error) = downloaded {
+            report.failed.push(format!("the download: {error}"));
+            report.written = 0;
+        }
+        self.report = Some(report);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn request_export(&mut self, ctx: &egui::Context, project: &Project, selected: &[ClipId], plan: &[PlannedFile]) {
         let Some(folder) = self.settings.folder.clone() else { return };
         let files = self.clips(project, selected).iter().zip(plan)
@@ -259,6 +302,7 @@ impl ExportDialog {
     }
 
     /// Runs the confirmed snapshot on a worker.
+    #[cfg(not(target_arch = "wasm32"))]
     fn start(&mut self, ctx: &egui::Context, pending: PendingExport, policy: ExistingFiles) {
         let PendingExport { project, folder, files, rate, format, .. } = pending;
         let total = files.len();
@@ -386,10 +430,14 @@ impl ExportDialog {
                 ctx.request_repaint();
             }
         });
+        // The browser version downloads a ZIP instead, so it never has conflicts to settle.
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(policy) = choice {
             let pending = self.pending.take().unwrap();
             self.start(ctx, pending, policy);
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = choice;
     }
 
     fn options_ui(
@@ -400,6 +448,8 @@ impl ExportDialog {
         native_dialogs: bool,
         blocked_dialogs: &mut u32,
     ) {
+        #[cfg(target_arch = "wasm32")]
+        let _ = (native_dialogs, &blocked_dialogs);
         let s = &mut self.settings;
         if selected_count == 0 {
             s.only_selected = false;
@@ -429,7 +479,13 @@ impl ExportDialog {
                 ui.label(RichText::new("Format").strong());
                 egui::ComboBox::from_id_salt("file_format").selected_text(s.format.label()).width(100.0)
                     .show_ui(ui, |ui| {
-                        for format in [FileFormat::Wav, FileFormat::Mp3, FileFormat::Ogg] {
+                        // MP3 and OGG need encoders that only exist in the desktop version.
+                        let formats: &[FileFormat] = if cfg!(target_arch = "wasm32") {
+                            &[FileFormat::Wav]
+                        } else {
+                            &[FileFormat::Wav, FileFormat::Mp3, FileFormat::Ogg]
+                        };
+                        for &format in formats {
                             ui.selectable_value(&mut s.format, format, format.label());
                         }
                     });
@@ -443,7 +499,12 @@ impl ExportDialog {
         ui.add_space(10.0);
         ui.label(RichText::new("Destination").strong());
         ui.horizontal(|ui| {
+            if cfg!(target_arch = "wasm32") {
+                ui.weak("The files download together as one ZIP.");
+                return;
+            }
             if ui.button("Choose folder…").on_hover_text("Choose where the files go").clicked() {
+                #[cfg(not(target_arch = "wasm32"))]
                 if native_dialogs {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         s.folder = Some(folder);

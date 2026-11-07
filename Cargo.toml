@@ -16,10 +16,8 @@ required-features = ["bridge"]
 
 [dependencies]
 audioadapter-buffers = "5"
-cpal = "0.18"
-eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "system_fonts"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
 hound = "3.5"
-tempfile = "3.27"
 rfd = "0.17"
 rubato = "5"
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu"], optional = true }
@@ -27,9 +25,27 @@ egui_system_font_provider = { version = "0.37", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 serde_json = { version = "1", optional = true }
 symphonia = { version = "0.6", features = ["wav", "pcm", "mp3", "flac", "ogg", "vorbis"] }
-mp3lame-encoder = "0.3.0"
-vorbis_rs = "0.5.6"
 egui-pop-phosphor = "0.15.0"
+web-time = "1"
+
+# Desktop only: native windows and fonts, sound devices, temp files, and the
+# MP3 and OGG encoders, which are C code that can't build for the web.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = "0.18"
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "system_fonts"] }
+mp3lame-encoder = "0.3.0"
+tempfile = "3.27"
+vorbis_rs = "0.5.6"
+
+# Web only: the browser's audio, files, storage and downloads.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+cpal = { version = "0.18", features = ["wasm-bindgen"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Document", "Element", "HtmlAnchorElement", "HtmlCanvasElement", "Storage", "Url", "Window", "MediaDevices", "MediaStream", "MediaStreamConstraints", "Navigator", "AudioContext", "AudioContextOptions", "MediaStreamAudioSourceNode", "ScriptProcessorNode", "AudioProcessingEvent", "AudioBuffer", "AudioNode", "AudioDestinationNode", "BaseAudioContext", "GainNode", "AudioParam", "console", "MediaStreamTrack"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Small, fast single executable for release.
 [profile.release]

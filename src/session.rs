@@ -8,6 +8,10 @@ const WAV_HEADER_SIZE: u64 = 100;
 
 /// Where autosaves and in-progress takes live, outside any synced folder.
 pub fn data_dir() -> Option<PathBuf> {
+    // The browser version has no folders; it keeps preferences in browser storage.
+    if cfg!(target_arch = "wasm32") {
+        return None;
+    }
     if let Some(dir) = std::env::var_os("KANTAN_DATA_DIR") {
         return Some(PathBuf::from(dir));
     }

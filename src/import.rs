@@ -48,8 +48,20 @@ struct Decoded {
 
 /// Reads a file into a source at `project_rate`. The source is built here so
 /// this whole slow step can run off the UI thread.
+/// Reads file contents into a source, as the browser version receives them.
+pub fn import_bytes(name: &str, bytes: Vec<u8>, project_rate: u32) -> Result<Source, ImportError> {
+    let extension = Path::new(name).extension().and_then(|e| e.to_str()).map(str::to_owned);
+    let stream = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
+    let decoded = decode_stream(stream, extension.as_deref())?;
+    finish_import(decoded, project_rate)
+}
+
 pub fn import_file(path: &Path, project_rate: u32) -> Result<Source, ImportError> {
     let decoded = decode(path)?;
+    finish_import(decoded, project_rate)
+}
+
+fn finish_import(decoded: Decoded, project_rate: u32) -> Result<Source, ImportError> {
     let (channels, samples) = reduce_channels(decoded.channels, decoded.samples);
     let samples = resample(&samples, channels, decoded.rate, project_rate)?;
     Ok(Source::new(channels as u16, samples)?)
@@ -58,9 +70,12 @@ pub fn import_file(path: &Path, project_rate: u32) -> Result<Source, ImportError
 fn decode(path: &Path) -> Result<Decoded, ImportError> {
     let file = std::fs::File::open(path).map_err(error)?;
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    decode_stream(stream, path.extension().and_then(|e| e.to_str()))
+}
 
+fn decode_stream(stream: MediaSourceStream, extension: Option<&str>) -> Result<Decoded, ImportError> {
     let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
+    if let Some(extension) = extension {
         hint.with_extension(extension);
     }
 

@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kantan Audio Manager</title>
+  <link rel="icon" href="icon.png">
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #181a1e; }
+    canvas { display: block; width: 100%; height: 100%; outline: none; }
+    #loading {
+      position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      color: #9aa0aa; font: 16px system-ui, sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="kantan_canvas"></canvas>
+  <div id="loading">Loading Kantan Audio Manager…</div>
+  <script type="module">
+    import init from "./kantan-audio-manager.js";
+    init().then(
+      () => document.getElementById("loading").remove(),
+      (error) => {
+        document.getElementById("loading").textContent = "Kantan Audio Manager couldn't start in this browser.";
+        console.error(error);
+      },
+    );
+  </script>
+</body>
+</html>

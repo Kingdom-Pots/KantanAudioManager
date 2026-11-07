@@ -2,14 +2,18 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use web_time::Instant;
 
 use eframe::egui::{self, Color32, Key, Modifiers};
 use egui_phosphor::regular as icons;
 
 use crate::about::AboutWindow;
 use crate::export_dialog::ExportDialog;
-use crate::import::{self, ImportError, SUPPORTED_EXTENSIONS};
+use crate::import::{self, ImportError};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::import::SUPPORTED_EXTENSIONS;
 use crate::playback::Player;
 use crate::project_file;
 use crate::session::{self, Orphans, Session};
@@ -35,6 +39,9 @@ const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
 enum AfterSave {
     Close,
     Open(PathBuf),
+    /// A project uploaded in the browser version, as its name and contents.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    OpenBytes(String, Vec<u8>),
 }
 
 /// A question that has to be answered before carrying on.
@@ -68,6 +75,12 @@ pub struct App {
     input: Option<recording::InputChoice>,
     meter: f32,
     about: AboutWindow,
+    prefs_path: Option<PathBuf>,
+    /// Files the browser hands over arrive here.
+    #[cfg(target_arch = "wasm32")]
+    web_events: (mpsc::Sender<crate::web::WebEvent>, Receiver<crate::web::WebEvent>),
+    #[cfg(target_arch = "wasm32")]
+    web_ctx: egui::Context,
     auto_split: bool,
     silence: SilenceSettings,
     project_path: Option<PathBuf>,
@@ -119,6 +132,11 @@ impl App {
             meter: 0.0,
             played_revision: 0,
             about: AboutWindow::default(),
+            prefs_path: None,
+            #[cfg(target_arch = "wasm32")]
+            web_events: mpsc::channel(),
+            #[cfg(target_arch = "wasm32")]
+            web_ctx: ctx.clone(),
             auto_split: false,
             silence: SilenceSettings::default(),
             project_path: None,
@@ -135,6 +153,10 @@ impl App {
 
     /// Claims this run's files and looks for work left by a crash.
     fn begin_session(&mut self) {
+        self.prefs_path = crate::prefs::path();
+        if let Some(path) = &self.prefs_path {
+            self.timeline.settings = crate::prefs::load(path);
+        }
         let Some(root) = session::data_dir() else { return };
         let orphans = session::find_orphans(&root);
         if orphans.is_empty() {
@@ -240,6 +262,12 @@ impl App {
         }
     }
 
+    /// Brings newly added clips into view, from where they start, without zooming.
+    fn reveal_from(&mut self, start: Frames) {
+        let end = self.document.project().clips().last().map_or(start, |c| c.end());
+        self.timeline.reveal(start, end);
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.saved_revision != Some(self.document.revision())
             || self.recorder.is_recording()
@@ -289,6 +317,93 @@ impl App {
         }
     }
 
+    /// The browser version saves by downloading the project file.
+    #[cfg(target_arch = "wasm32")]
+    fn save(&mut self) -> bool {
+        self.save_as()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn save_as(&mut self) -> bool {
+        let stem = self
+            .project_path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map_or_else(|| "Untitled".to_owned(), |s| s.to_string_lossy().into_owned());
+        let name = format!("{stem}.{}", project_file::EXTENSION);
+        let bytes = project_file::to_bytes(self.document.project(), &self.settings_pairs());
+        match crate::web::download(&name, &bytes) {
+            Ok(()) => {
+                self.project_path = Some(PathBuf::from(name));
+                self.saved_revision = Some(self.document.revision());
+                true
+            }
+            Err(error) => {
+                self.error = Some(format!("Couldn't save: {error}"));
+                false
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn pick_project(&mut self) {
+        crate::web::pick_files(self.web_events.0.clone(), self.web_ctx.clone(), false);
+    }
+
+    /// Opens a project from uploaded contents, asking about unsaved changes first.
+    #[cfg(target_arch = "wasm32")]
+    fn request_open_bytes(&mut self, name: String, bytes: Vec<u8>) {
+        if self.is_dirty() {
+            self.prompt = Some(Prompt::Unsaved(AfterSave::OpenBytes(name, bytes)));
+        } else {
+            self.open_project_bytes(name, &bytes);
+        }
+    }
+
+    fn open_project_bytes(&mut self, name: String, bytes: &[u8]) {
+        match project_file::load_bytes(bytes) {
+            Ok((project, settings)) => {
+                self.replace_document(project, &settings);
+                self.project_path = Some(PathBuf::from(name));
+            }
+            Err(error) => self.error = Some(format!("Couldn't open: {error}")),
+        }
+    }
+
+    /// Imports audio the browser handed over, decoding it in place.
+    #[cfg(target_arch = "wasm32")]
+    fn start_import_bytes(&mut self, mut files: Vec<(String, Vec<u8>)>) {
+        if self.importing.is_some() {
+            self.error = Some("Wait for the current import to finish.".to_owned());
+            return;
+        }
+        self.error = None;
+        files.sort_by(|a, b| import::natural_cmp(&a.0, &b.0));
+        let rate = self.document.project().sample_rate();
+        let imported = files
+            .into_iter()
+            .map(|(name, bytes)| Imported {
+                name: Path::new(&name).file_stem().map_or_else(|| "Clip".to_owned(), |s| s.to_string_lossy().into_owned()),
+                result: import::import_bytes(&name, bytes, rate),
+            })
+            .collect();
+        let (sender, receiver) = mpsc::channel();
+        let _ = sender.send(imported);
+        self.importing = Some(receiver);
+    }
+
+    /// Handles files the browser finished reading.
+    #[cfg(target_arch = "wasm32")]
+    fn take_web_events(&mut self) {
+        while let Ok(event) = self.web_events.1.try_recv() {
+            match event {
+                crate::web::WebEvent::Import(files) => self.start_import_bytes(files),
+                crate::web::WebEvent::Open(name, bytes) => self.request_open_bytes(name, bytes),
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn save(&mut self) -> bool {
         match self.project_path.clone() {
             Some(path) => self.save_to(path),
@@ -296,6 +411,7 @@ impl App {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_as(&mut self) -> bool {
         if !self.native_dialogs {
             self.blocked_dialogs += 1;
@@ -311,6 +427,7 @@ impl App {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn pick_project(&mut self) {
         if !self.native_dialogs {
             self.blocked_dialogs += 1;
@@ -375,7 +492,7 @@ impl App {
         self.selection = Selection::default();
         self.export.settings.apply_pairs(settings);
         self.apply_silence_pairs(settings);
-        self.timeline.request_fit();
+        self.timeline.reset_view();
         self.error = None;
     }
 
@@ -383,6 +500,7 @@ impl App {
         match after {
             AfterSave::Close => self.closing = true,
             AfterSave::Open(path) => self.open_project(path),
+            AfterSave::OpenBytes(name, bytes) => self.open_project_bytes(name, &bytes),
         }
     }
 
@@ -441,7 +559,7 @@ impl App {
         self.last_autosave = Instant::now();
         let (sender, receiver) = mpsc::channel();
         let (app_sender, app_receiver) = mpsc::channel();
-        std::thread::spawn(move || {
+        crate::run_in_background(move || {
             // A failure only means less to recover, and the next attempt may work.
             let _ = project_file::save(&path, &project, &settings);
             let _ = sender.send(());
@@ -573,6 +691,10 @@ impl App {
         &self.timeline
     }
 
+    pub fn timeline_mut(&mut self) -> &mut Timeline {
+        &mut self.timeline
+    }
+
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -621,6 +743,7 @@ impl App {
 
     /// Adds finished takes, and keeps what was captured if the mic disappears.
     fn update_recording(&mut self, ctx: &egui::Context) {
+        self.recorder.pump();
         if let Some(reason) = self.recorder.device_lost() {
             self.recorder.stop();
             self.error = Some(format!("The recording input stopped working ({reason}). The take so far was kept."));
@@ -637,6 +760,7 @@ impl App {
         match self.recorder.poll_finished() {
             Some(Ok(source)) => {
                 let split = self.auto_split.then_some(self.silence);
+                let take_start = self.document.project().next_take_start();
                 let result = self.document.edit("Record", |project| {
                     let name = project.next_recording_name();
                     let source = project.insert_source(source);
@@ -644,7 +768,7 @@ impl App {
                     split_if_on(project, id, split)
                 });
                 self.report(result);
-                self.timeline.request_fit();
+                self.reveal_from(take_start);
             }
             Some(Err(error)) => self.error = Some(format!("Couldn't keep the take: {error}")),
             None => {}
@@ -795,8 +919,8 @@ impl App {
         self.timeline.cancel_drag();
         let was_empty = self.document.project().clips().is_empty();
         if step(&mut self.document).is_some() && was_empty {
-            // Coming back from an empty track, show everything that returned.
-            self.timeline.request_fit();
+            // Coming back from an empty track, show where it starts.
+            self.timeline.reset_view();
         }
     }
 
@@ -981,6 +1105,12 @@ impl App {
         self.blocked_dialogs
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn pick_files(&mut self, ctx: &egui::Context) {
+        crate::web::pick_files(self.web_events.0.clone(), ctx.clone(), true);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn pick_files(&mut self, ctx: &egui::Context) {
         if !self.native_dialogs {
             self.blocked_dialogs += 1;
@@ -1014,7 +1144,7 @@ impl App {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         let rate = self.document.project().sample_rate();
-        std::thread::spawn(move || {
+        crate::run_in_background(move || {
             let imported = paths
                 .iter()
                 .map(|path| Imported {
@@ -1057,6 +1187,7 @@ impl App {
         // One undo step, however many files were in the batch.
         let label = "Import";
         let split = self.auto_split.then_some(self.silence);
+        let import_start = self.document.project().next_take_start();
         let result = self.document.edit(label, |project| {
             for (name, source) in sources {
                 let source = project.insert_source(source);
@@ -1066,11 +1197,20 @@ impl App {
             Ok(())
         });
         match result {
-            Ok(()) => self.timeline.request_fit(),
+            Ok(()) => self.reveal_from(import_start),
             Err(error) => self.error = Some(error.to_string()),
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<egui::DroppedFileHandle> = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            crate::web::read_dropped(dropped, self.web_events.0.clone(), ctx.clone());
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
@@ -1189,7 +1329,7 @@ impl App {
             if icon_button(ui, icons::MAGNIFYING_GLASS_PLUS, "+", "Zoom in (Ctrl+Scroll)").clicked() {
                 self.timeline.zoom_centered(ZOOM_STEP);
             }
-            if icon_button(ui, icons::ARROWS_OUT_LINE_HORIZONTAL, "Fit", "Show the whole track").clicked() {
+            if icon_button(ui, icons::ARROWS_OUT_LINE_HORIZONTAL, "Fit", "Show the whole project at once").clicked() {
                 self.timeline.request_fit();
             }
             ui.separator();
@@ -1245,13 +1385,14 @@ impl App {
         }
     }
 
-    /// Shows a hint on an empty project, and while files are dragged over.
-    fn paint_overlay(&self, ctx: &egui::Context, rect: egui::Rect, painter: &egui::Painter) {
+    /// Shows a hint in the track on an empty project, and while files are dragged over.
+    fn paint_overlay(&self, ctx: &egui::Context, painter: &egui::Painter) {
+        let rect = self.timeline.lane_rect();
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let text = if hovering {
             "Drop to import"
         } else if self.document.project().clips().is_empty() && self.importing.is_none() {
-            "Drag audio files here, or press Ctrl+O"
+            "Drag audio files here, press Ctrl+O to import, or R to record"
         } else {
             return;
         };
@@ -1268,6 +1409,8 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(target_arch = "wasm32")]
+        self.take_web_events();
         self.finish_import();
         // The export window is modal, and its text boxes need keys like Ctrl+A.
         self.update_window(&ctx);
@@ -1293,7 +1436,6 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                let rect = ui.available_rect_before_wrap();
                 let playhead = self.player.position();
                 let project = self.document.project();
                 let (timeline, selection) = (&mut self.timeline, &mut self.selection);
@@ -1314,10 +1456,15 @@ impl eframe::App for App {
                     Some(action) => action,
                     None => timeline.show(ui, project, selection, playhead, None),
                 };
-                self.paint_overlay(&ctx, rect, ui.painter());
+                self.paint_overlay(&ctx, ui.painter());
             });
         if let Some(action) = action {
             self.run_action(action);
+        }
+        if self.timeline.take_settings_changed()
+            && let Some(path) = &self.prefs_path
+        {
+            crate::prefs::save(path, &self.timeline.settings);
         }
         self.show_dialog(&ctx);
         self.show_prompt(&ctx);

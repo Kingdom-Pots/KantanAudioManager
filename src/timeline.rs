@@ -2,7 +2,7 @@
 
 use eframe::egui::{
     self,
-    Align2, Color32, CornerRadius, FontId, Modifiers, Painter, Pos2, Rect, Response, Sense,
+    Align2, Color32, CornerRadius, RichText, FontId, Modifiers, Painter, Pos2, Rect, Response, Sense,
     Stroke, StrokeKind, Ui, pos2, vec2,
 };
 
@@ -12,7 +12,13 @@ use crate::peaks::clip_min_max;
 use crate::{Clip, ClipId, Frames, Project, TimeRange};
 
 const RULER_HEIGHT: f32 = 24.0;
-const SCROLLBAR_HEIGHT: f32 = 14.0;
+const OVERVIEW_HEIGHT: f32 = 54.0;
+const OVERVIEW_GAP: f32 = 12.0;
+const OVERVIEW_HEADER: f32 = 24.0;
+/// Space around the track and overview panels.
+const PANEL_MARGIN: f32 = 10.0;
+/// How near, on screen, the pointer must be to grab an edge of the overview window.
+const EDGE_GRAB: f32 = 9.0;
 const CLIP_HEADER_HEIGHT: f32 = 22.0;
 const LANE_MARGIN: f32 = 8.0;
 /// Closest zoom: each frame is 16 points wide.
@@ -42,8 +48,46 @@ const WAVEFORM_OVER: Color32 = Color32::from_rgb(235, 90, 80);
 const RANGE: Color32 = Color32::from_rgba_premultiplied(45, 45, 45, 45);
 const PLAYHEAD: Color32 = Color32::from_rgb(110, 225, 130);
 const CURSOR: Color32 = Color32::from_rgb(245, 245, 245);
+const TICK_LABEL_DIM: Color32 = Color32::from_rgb(130, 136, 146);
+const PANEL: Color32 = Color32::from_rgb(30, 33, 38);
+const PANEL_BORDER: Color32 = Color32::from_rgb(56, 61, 70);
+const OVERVIEW_CLIP: Color32 = Color32::from_rgb(58, 70, 88);
+const OVERVIEW_CLIP_SELECTED: Color32 = Color32::from_rgb(52, 120, 200);
+const OVERVIEW_WINDOW: Color32 = Color32::from_rgba_premultiplied(30, 30, 30, 30);
 const SCROLL_TRACK: Color32 = Color32::from_rgb(34, 37, 43);
-const SCROLL_THUMB: Color32 = Color32::from_rgb(85, 92, 104);
+
+/// How the track is shown. Saved as app preferences.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackSettings {
+    /// How much time the track shows at once, in seconds.
+    pub visible_seconds: f32,
+    /// The tallest clips get, however big the window is.
+    pub clip_height: f32,
+}
+
+impl TrackSettings {
+    pub const MIN_VISIBLE_SECONDS: f32 = 1.0;
+    pub const MAX_VISIBLE_SECONDS: f32 = 600.0;
+    pub const MIN_CLIP_HEIGHT: f32 = 80.0;
+    pub const MAX_CLIP_HEIGHT: f32 = 400.0;
+
+    pub fn clamped(self) -> Self {
+        let pick = |value: f32, default: f32, lo: f32, hi: f32| {
+            if value.is_finite() { value.clamp(lo, hi) } else { default }
+        };
+        let default = Self::default();
+        Self {
+            visible_seconds: pick(self.visible_seconds, default.visible_seconds, Self::MIN_VISIBLE_SECONDS, Self::MAX_VISIBLE_SECONDS),
+            clip_height: pick(self.clip_height, default.clip_height, Self::MIN_CLIP_HEIGHT, Self::MAX_CLIP_HEIGHT),
+        }
+    }
+}
+
+impl Default for TrackSettings {
+    fn default() -> Self {
+        Self { visible_seconds: 20.0, clip_height: 180.0 }
+    }
+}
 
 /// What part of the timeline is on screen.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -239,26 +283,63 @@ enum Drag {
     None,
     Range { start: Frames },
     Clip { id: ClipId, grab: Frames, start: Frames },
-    Scrollbar { grab: f64 },
+    /// Moving the overview's window, held this many frames from its left edge.
+    Overview { grab: f64 },
+    /// Resizing the overview's window by one edge.
+    OverviewEdge { left: bool },
 }
 
 /// Screen areas of the timeline.
+#[derive(Clone, Copy)]
 struct Areas {
     ruler: Rect,
     lane: Rect,
-    scrollbar: Rect,
+    /// The border around the ruler and lane.
+    track_panel: Rect,
+    overview: Rect,
+    /// The overview's title row.
+    overview_header: Rect,
+    /// The border around the overview and its title.
+    overview_panel: Rect,
 }
 
 impl Areas {
-    fn new(rect: Rect) -> Self {
-        let ruler = Rect::from_min_size(rect.min, vec2(rect.width(), RULER_HEIGHT));
-        let scrollbar = Rect::from_min_max(
-            pos2(rect.left(), rect.bottom() - SCROLLBAR_HEIGHT),
-            rect.max,
-        );
-        let lane = Rect::from_min_max(pos2(rect.left(), ruler.bottom()), pos2(rect.right(), scrollbar.top()));
-        Self { ruler, lane, scrollbar }
+    /// The lane grows with the window only until clips reach `clip_height`.
+    /// The overview sits right under it, and any extra space stays empty below.
+    /// The overview docks at the bottom, and the track panel fills the space above
+    /// it. Clips only grow to `clip_height`, so any extra height is plain track
+    /// background below them. `with_overview` is false for an empty project.
+    fn new(rect: Rect, clip_height: f32, with_overview: bool) -> Self {
+        let inner = rect.shrink(PANEL_MARGIN);
+        let ruler = Rect::from_min_size(inner.min, vec2(inner.width(), RULER_HEIGHT));
+
+        let (overview_header, overview, track_bottom) = if with_overview {
+            // Never pushed above a minimal track, however short the window.
+            let lowest_top = ruler.bottom() + 40.0 + OVERVIEW_GAP;
+            let overview_top = (inner.bottom() - OVERVIEW_HEIGHT - OVERVIEW_HEADER).max(lowest_top);
+            let header = Rect::from_min_size(pos2(inner.left(), overview_top), vec2(inner.width(), OVERVIEW_HEADER));
+            let strip = Rect::from_min_size(header.left_bottom(), vec2(inner.width(), OVERVIEW_HEIGHT));
+            (header, strip, header.top() - OVERVIEW_GAP)
+        } else {
+            (Rect::NOTHING, Rect::NOTHING, inner.bottom())
+        };
+
+        let room = (track_bottom - ruler.bottom()).max(40.0);
+        let lane_height = room.min(clip_height + 2.0 * LANE_MARGIN);
+        let lane = Rect::from_min_size(pos2(inner.left(), ruler.bottom()), vec2(inner.width(), lane_height));
+        let track_panel = Rect::from_min_max(ruler.min, pos2(inner.right(), track_bottom.max(lane.bottom())));
+        let overview_panel = if with_overview { overview_header.union(overview) } else { Rect::NOTHING };
+        Self { ruler, lane, track_panel, overview, overview_header, overview_panel }
     }
+
+    const NOTHING: Self = Self {
+        ruler: Rect::NOTHING,
+        lane: Rect::NOTHING,
+        track_panel: Rect::NOTHING,
+        overview: Rect::NOTHING,
+        overview_header: Rect::NOTHING,
+        overview_panel: Rect::NOTHING,
+    };
 
     fn clip_rect(&self, view: &View, clip: &Clip) -> Rect {
         let left = self.lane.left() + view.offset_of(clip.start as f64) as f32;
@@ -277,8 +358,17 @@ pub struct Timeline {
     /// Lane width from the last frame, for zoom requests made outside it.
     width: f64,
     extent: f64,
-    /// Screen area from the last frame.
-    rect: Rect,
+    /// Screen areas from the last frame.
+    areas: Areas,
+    pub settings: TrackSettings,
+    settings_changed: bool,
+    /// Apply the visible range setting and go to the start, on the next frame.
+    reset_requested: bool,
+    /// A span of the timeline to bring into view on the next frame.
+    reveal_requested: Option<(Frames, Frames)>,
+    /// Whether the right-click menu was opened on the overview.
+    menu_on_overview: bool,
+    sample_rate: f64,
     action: Option<TimelineAction>,
     /// Where the right-click menu was opened.
     menu_frame: Frames,
@@ -289,10 +379,16 @@ impl Default for Timeline {
         Self {
             view: View { scroll: 0.0, frames_per_point: 100.0 },
             drag: Drag::None,
-            fit_requested: true,
+            fit_requested: false,
             width: 1.0,
             extent: 1.0,
-            rect: Rect::NOTHING,
+            areas: Areas::NOTHING,
+            settings: TrackSettings::default(),
+            settings_changed: false,
+            reset_requested: true,
+            reveal_requested: None,
+            menu_on_overview: false,
+            sample_rate: 48000.0,
             action: None,
             menu_frame: 0,
         }
@@ -312,12 +408,12 @@ impl Timeline {
     /// Where a clip is on screen as of the last frame. It can be partly or
     /// entirely outside the lane when zoomed in.
     pub fn clip_rect(&self, clip: &Clip) -> Rect {
-        Areas::new(self.rect).clip_rect(&self.view, clip)
+        self.areas.clip_rect(&self.view, clip)
     }
 
     /// A point on the part of a clip's header that is on screen, if any.
     pub fn clip_header_point(&self, clip: &Clip) -> Option<Pos2> {
-        let lane = Areas::new(self.rect).lane;
+        let lane = self.areas.lane;
         let rect = self.clip_rect(clip);
         let left = rect.left().max(lane.left());
         let right = rect.right().min(lane.right());
@@ -326,18 +422,68 @@ impl Timeline {
 
     /// The screen position of a timeline frame, halfway down the waveform lane.
     pub fn lane_point(&self, frame: f64) -> Pos2 {
-        let lane = Areas::new(self.rect).lane;
+        let lane = self.areas.lane;
         let x = lane.left() + self.view.offset_of(frame) as f32;
         pos2(x, lane.top() + lane.height() * 0.6)
     }
 
-    /// The middle of the scrollbar's thumb as of the last frame.
-    pub fn scrollbar_thumb_center(&self) -> Pos2 {
-        self.scrollbar_thumb(&Areas::new(self.rect)).center()
+    /// The middle of the overview's window as of the last frame.
+    pub fn overview_window_center(&self) -> Pos2 {
+        self.overview_window(&self.areas).center()
     }
 
+    /// A point on one edge of the overview's window.
+    pub fn overview_edge_point(&self, left: bool) -> Pos2 {
+        let window = self.overview_window(&self.areas);
+        let x = if left { window.left() } else { window.right() };
+        pos2(x, window.center().y)
+    }
+
+    /// The overview's position for a timeline frame.
+    pub fn overview_point(&self, frame: f64) -> Pos2 {
+        pos2(self.overview_x(&self.areas, frame), self.areas.overview.center().y)
+    }
+
+    pub fn lane_height(&self) -> f32 {
+        self.areas.lane.height()
+    }
+
+    /// How many seconds the track shows right now.
+    pub fn visible_seconds(&self) -> f64 {
+        self.width * self.view.frames_per_point / self.sample_rate
+    }
+
+    /// Shows the whole project at once.
     pub fn request_fit(&mut self) {
         self.fit_requested = true;
+    }
+
+    /// Goes back to the start at the visible range setting, as for a newly opened project.
+    pub fn reset_view(&mut self) {
+        self.reset_requested = true;
+    }
+
+    /// Scrolls, without zooming, so a span of the timeline is on screen.
+    pub fn reveal(&mut self, start: Frames, end: Frames) {
+        self.reveal_requested = Some((start, end));
+    }
+
+    /// Changes the settings, applying a new visible range around the middle of the view.
+    pub fn set_settings(&mut self, settings: TrackSettings) {
+        let settings = settings.clamped();
+        if settings.visible_seconds != self.settings.visible_seconds {
+            let wanted = settings.visible_seconds as f64 * self.sample_rate / self.width.max(1.0);
+            self.view.zoom(self.view.frames_per_point / wanted, self.width / 2.0, self.width, self.extent);
+        }
+        if settings != self.settings {
+            self.settings = settings;
+            self.settings_changed = true;
+        }
+    }
+
+    /// Whether the settings changed since this was last asked, so they can be saved.
+    pub fn take_settings_changed(&mut self) -> bool {
+        std::mem::take(&mut self.settings_changed)
     }
 
     /// Zooms around the middle of the view, for the toolbar buttons.
@@ -354,16 +500,33 @@ impl Timeline {
         live: Option<LivePreview<'_>>,
     ) -> Option<TimelineAction> {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-        let areas = Areas::new(rect);
-        self.rect = rect;
+        let with_overview = !project.clips().is_empty() || live.is_some();
+        let areas = Areas::new(rect, self.settings.clip_height, with_overview);
+        self.areas = areas;
+        self.sample_rate = project.sample_rate() as f64;
 
         self.width = areas.lane.width() as f64;
-        self.extent = extent(project);
+        // Never shorter than the visible range, so a short project can't force a closer zoom.
+        let visible_setting = self.settings.visible_seconds as f64 * project.sample_rate() as f64;
+        self.extent = extent(project).max(visible_setting);
         if let Some(live) = &live {
             self.extent = self.extent.max((live.start + live.len) as f64 * 1.02);
         }
+        if std::mem::take(&mut self.reset_requested) {
+            self.view.scroll = 0.0;
+            self.view.frames_per_point =
+                self.settings.visible_seconds as f64 * self.sample_rate / self.width.max(1.0);
+        }
         if std::mem::take(&mut self.fit_requested) {
             self.view.fit(self.width, self.extent);
+        }
+        if let Some((start, end)) = self.reveal_requested.take() {
+            self.view.clamp(self.width, self.extent);
+            let visible = self.width * self.view.frames_per_point;
+            if (start as f64) < self.view.scroll || end as f64 > self.view.scroll + visible {
+                // A little room before the start, so it doesn't sit against the edge.
+                self.view.scroll = (start as f64 - visible * 0.05).max(0.0);
+            }
         }
         self.handle_zoom_and_scroll(ui, &response, &areas);
         self.view.clamp(self.width, self.extent);
@@ -382,8 +545,11 @@ impl Timeline {
         }
         self.view.clamp(self.width, self.extent);
 
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
+        let window_painter = ui.painter_at(rect);
+        window_painter.rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
+        self.paint_panels(&window_painter, &areas, project);
+        // Everything on the track stays inside its panel.
+        let painter = window_painter.with_clip_rect(areas.track_panel);
         let dragged = match self.drag {
             Drag::Clip { id, .. } => Some(id),
             _ => None,
@@ -408,20 +574,37 @@ impl Timeline {
                 Stroke::new(1.5, PLAYHEAD),
             );
         }
-        self.paint_scrollbar(&painter, &areas);
         self.paint_clip_drag(&painter, &areas, project);
+        if with_overview {
+            self.paint_overview(&window_painter, &areas, project, selection, playhead, live.as_ref());
+        }
+        // The borders go last, so nothing draws over them.
+        let border = Stroke::new(1.0, PANEL_BORDER);
+        window_painter.rect_stroke(areas.track_panel.expand(1.0), CornerRadius::same(4), border, StrokeKind::Outside);
+        if with_overview {
+            window_painter.rect_stroke(areas.overview_panel.expand(1.0), CornerRadius::same(4), border, StrokeKind::Outside);
+        }
         self.action.take()
     }
 
     /// Shows what a drag would do: move a clip, or select a range.
     fn update_pointer_icon(&self, ui: &Ui, response: &Response, areas: &Areas, project: &Project) {
-        let icon = if matches!(self.drag, Drag::Clip { .. }) {
+        let icon = if matches!(self.drag, Drag::Clip { .. } | Drag::Overview { .. }) {
             Some(egui::CursorIcon::Grabbing)
+        } else if matches!(self.drag, Drag::OverviewEdge { .. }) {
+            Some(egui::CursorIcon::ResizeHorizontal)
         } else {
             response.hover_pos().and_then(|pos| {
-                if self.clip_header_at(areas, project, pos).is_some() {
+                let window = self.overview_window(areas);
+                let near_edge = (pos.x - window.left()).abs() <= EDGE_GRAB
+                    || (pos.x - window.right()).abs() <= EDGE_GRAB;
+                if areas.overview.contains(pos) && near_edge {
+                    Some(egui::CursorIcon::ResizeHorizontal)
+                } else if (areas.overview.contains(pos) && window.x_range().contains(pos.x))
+                    || self.clip_header_at(areas, project, pos).is_some()
+                {
                     Some(egui::CursorIcon::Grab)
-                } else if areas.lane.contains(pos) {
+                } else if areas.track_panel.contains(pos) {
                     Some(egui::CursorIcon::Text)
                 } else {
                     None
@@ -439,8 +622,8 @@ impl Timeline {
             return None;
         }
         let pos = response.hover_pos()?;
-        if areas.scrollbar.contains(pos) {
-            Some("Drag to scroll along the track")
+        if areas.overview.contains(pos) {
+            Some("Project overview: the whole project. Drag the window to move through it, or drag its edges to show more or less. Click to jump there. Right-click for view settings.")
         } else if areas.ruler.contains(pos) {
             Some("Click to move the cursor here. Ctrl+Scroll zooms.")
         } else if self.clip_header_at(areas, project, pos).is_some() {
@@ -453,6 +636,38 @@ impl Timeline {
     }
 
     fn context_menu(&mut self, response: &Response, project: &Project, selection: &Selection) {
+        if self.menu_on_overview {
+            let mut settings = self.settings;
+            let mut visible = self.visible_seconds() as f32;
+            response.context_menu(|ui| {
+                ui.label(RichText::new("Track view").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Visible range");
+                    ui.add(
+                        egui::DragValue::new(&mut visible)
+                            .speed(0.5)
+                            .range(TrackSettings::MIN_VISIBLE_SECONDS..=TrackSettings::MAX_VISIBLE_SECONDS)
+                            .suffix(" s"),
+                    )
+                    .on_hover_text("How much time the track shows at once. Dragging the window's edges changes this too.");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Clip height");
+                    ui.add(
+                        egui::DragValue::new(&mut settings.clip_height)
+                            .speed(1.0)
+                            .range(TrackSettings::MIN_CLIP_HEIGHT..=TrackSettings::MAX_CLIP_HEIGHT)
+                            .suffix(" px"),
+                    )
+                    .on_hover_text("The tallest clips get, however big the window is");
+                });
+            });
+            if (visible - self.visible_seconds() as f32).abs() > 0.01 {
+                settings.visible_seconds = visible;
+            }
+            self.set_settings(settings);
+            return;
+        }
         let frame = self.menu_frame;
         let mut action = None;
         response.context_menu(|ui| {
@@ -619,8 +834,8 @@ impl Timeline {
 
         if response.drag_started() {
             let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(areas.lane.center());
-            self.drag = if areas.scrollbar.contains(origin) {
-                Drag::Scrollbar { grab: self.scrollbar_grab(areas, origin.x) }
+            self.drag = if areas.overview.contains(origin) {
+                self.start_overview_drag(areas, origin.x)
             } else if let Some(clip) = self.clip_header_at(areas, project, origin) {
                 let grabbed = frame_at(&self.view, origin.x);
                 Drag::Clip { id: clip.id, grab: grabbed.saturating_sub(clip.start), start: clip.start }
@@ -639,7 +854,10 @@ impl Timeline {
                     let x = pointer.x.clamp(areas.lane.left(), areas.lane.right());
                     selection.set_range(start, frame_at(&self.view, x));
                 }
-                Drag::Scrollbar { grab } => self.drag_scrollbar(areas, pointer.x, grab),
+                Drag::Overview { grab } => {
+                    self.view.scroll = self.overview_frame(areas, pointer.x) - grab;
+                }
+                Drag::OverviewEdge { left } => self.drag_overview_edge(areas, pointer.x, left),
                 Drag::Clip { id, grab, .. } => {
                     self.scroll_past_edges(ui, areas, pointer.x);
                     let start = frame_at(&self.view, pointer.x).saturating_sub(grab);
@@ -665,6 +883,7 @@ impl Timeline {
         if response.secondary_clicked()
             && let Some(pointer) = response.interact_pointer_pos()
         {
+            self.menu_on_overview = areas.overview.contains(pointer);
             self.menu_frame = frame_at(&self.view, pointer.x);
             // The menu acts on the selection, so a clip outside it joins by replacing it.
             let in_range = selection.range.is_some_and(|r| self.menu_frame >= r.start && self.menu_frame < r.end);
@@ -685,9 +904,9 @@ impl Timeline {
 
         if response.clicked() {
             let Some(pointer) = response.interact_pointer_pos() else { return };
-            if areas.scrollbar.contains(pointer) {
-                let thumb = self.scrollbar_thumb(areas);
-                self.drag_scrollbar(areas, pointer.x, thumb.width() as f64 / 2.0);
+            if areas.overview.contains(pointer) {
+                let visible = self.width * self.view.frames_per_point;
+                self.view.scroll = self.overview_frame(areas, pointer.x) - visible / 2.0;
             } else if let Some(clip) = self.clip_header_at(areas, project, pointer) {
                 selection.click_clip(project, clip, modifiers);
             } else if let Some(clip) = self.clip_at(areas, project, pointer) {
@@ -719,6 +938,166 @@ impl Timeline {
         project.clips().iter().find(|clip| areas.clip_rect(&self.view, clip).contains(pos))
     }
 
+    /// The overview's x for a timeline frame. The overview always shows the whole project.
+    fn overview_x(&self, areas: &Areas, frame: f64) -> f32 {
+        let area = areas.overview;
+        area.left() + (frame / self.extent.max(1.0)) as f32 * area.width()
+    }
+
+    fn overview_frame(&self, areas: &Areas, x: f32) -> f64 {
+        let area = areas.overview;
+        ((x - area.left()) / area.width().max(1.0)) as f64 * self.extent
+    }
+
+    /// The part of the overview the track shows, at least wide enough to grab.
+    fn overview_window(&self, areas: &Areas) -> Rect {
+        let visible = self.width * self.view.frames_per_point;
+        let left = self.overview_x(areas, self.view.scroll);
+        let right = self.overview_x(areas, self.view.scroll + visible).max(left + 6.0);
+        Rect::from_min_max(pos2(left, areas.overview.top()), pos2(right, areas.overview.bottom()))
+    }
+
+    fn start_overview_drag(&mut self, areas: &Areas, x: f32) -> Drag {
+        let window = self.overview_window(areas);
+        if (x - window.left()).abs() <= EDGE_GRAB {
+            return Drag::OverviewEdge { left: true };
+        }
+        if (x - window.right()).abs() <= EDGE_GRAB {
+            return Drag::OverviewEdge { left: false };
+        }
+        let visible = self.width * self.view.frames_per_point;
+        if !window.x_range().contains(x) {
+            // Outside the window, jump there first, then drag from its middle.
+            self.view.scroll = self.overview_frame(areas, x) - visible / 2.0;
+        }
+        Drag::Overview { grab: self.overview_frame(areas, x) - self.view.scroll }
+    }
+
+    /// Moves one edge of the window, keeping the other where it is.
+    fn drag_overview_edge(&mut self, areas: &Areas, x: f32, left: bool) {
+        let visible = self.width * self.view.frames_per_point;
+        let (start, end) = (self.view.scroll, self.view.scroll + visible);
+        let narrowest = self.width * MIN_FRAMES_PER_POINT;
+        let frame = self.overview_frame(areas, x).clamp(0.0, self.extent);
+        let (start, end) = if left {
+            (frame.min(end - narrowest), end)
+        } else {
+            (start, frame.max(start + narrowest))
+        };
+        self.view.scroll = start;
+        self.view.frames_per_point = (end - start) / self.width.max(1.0);
+        self.settings.visible_seconds = (self.visible_seconds() as f32)
+            .clamp(TrackSettings::MIN_VISIBLE_SECONDS, TrackSettings::MAX_VISIBLE_SECONDS);
+        self.settings_changed = true;
+    }
+
+    /// The panel backgrounds, and the overview's title row.
+    fn paint_panels(&self, painter: &Painter, areas: &Areas, project: &Project) {
+        painter.rect_filled(areas.track_panel, CornerRadius::same(4), BACKGROUND);
+        if areas.overview_panel.width() <= 0.0 {
+            return;
+        }
+        let header = areas.overview_header;
+        painter.rect_filled(header, CornerRadius::same(4), PANEL);
+        painter.text(
+            pos2(header.left() + 8.0, header.center().y),
+            Align2::LEFT_CENTER,
+            "Project overview",
+            FontId::proportional(13.0),
+            LABEL,
+        );
+        let clips = project.clips().len();
+        let length = project.clips().last().map_or(0, Clip::end);
+        let noun = if clips == 1 { "clip" } else { "clips" };
+        painter.text(
+            pos2(header.right() - 8.0, header.center().y),
+            Align2::RIGHT_CENTER,
+            format!("{clips} {noun}  ·  {}", format_time(length, project.sample_rate())),
+            FontId::proportional(12.0),
+            TICK_LABEL_DIM,
+        );
+    }
+
+    /// Whether the project overview is shown, as of the last frame.
+    pub fn overview_shown(&self) -> bool {
+        self.areas.overview.width() > 0.0
+    }
+
+    /// The lane, for drawing hints over the track.
+    pub fn lane_rect(&self) -> Rect {
+        self.areas.lane
+    }
+
+    fn paint_overview(
+        &self,
+        painter: &Painter,
+        areas: &Areas,
+        project: &Project,
+        selection: &Selection,
+        playhead: Option<Frames>,
+        live: Option<&LivePreview<'_>>,
+    ) {
+        let area = areas.overview;
+        let painter = painter.with_clip_rect(area);
+        painter.rect_filled(area, CornerRadius::same(3), SCROLL_TRACK);
+        let x_of = |frame: f64| self.overview_x(areas, frame);
+        let top = area.top() + 5.0;
+        let bottom = area.bottom() - 5.0;
+
+        for clip in project.clips() {
+            let rect = Rect::from_min_max(
+                pos2(x_of(clip.start as f64), top),
+                pos2(x_of(clip.end() as f64).max(x_of(clip.start as f64) + 1.0), bottom),
+            );
+            let selected = selection.clips.contains(&clip.id);
+            painter.rect_filled(rect, CornerRadius::same(2), if selected { OVERVIEW_CLIP_SELECTED } else { OVERVIEW_CLIP });
+            // A tiny waveform, so lines can be told apart at a glance.
+            let center = rect.center().y;
+            let half = rect.height() / 2.0 - 2.0;
+            let frames_per_point = self.extent / area.width().max(1.0) as f64;
+            let mut x = rect.left().floor();
+            while x < rect.right() {
+                let local = ((x - rect.left()) as f64 * frames_per_point) as Frames;
+                let len = (frames_per_point as Frames).max(1);
+                let (lo, hi) = clip_min_max(project, clip, local, len);
+                let level = lo.abs().max(hi.abs()).min(1.0) * half;
+                painter.line_segment(
+                    [pos2(x + 0.5, center - level), pos2(x + 0.5, center + level.max(0.5))],
+                    Stroke::new(1.0, WAVEFORM),
+                );
+                x += 1.0;
+            }
+        }
+        if let Some(live) = live {
+            let rect = Rect::from_min_max(
+                pos2(x_of(live.start as f64), top),
+                pos2(x_of((live.start + live.len) as f64).max(x_of(live.start as f64) + 1.0), bottom),
+            );
+            painter.rect_filled(rect, CornerRadius::same(2), LIVE_HEADER);
+        }
+        if let Some(range) = selection.range {
+            let rect = Rect::from_min_max(pos2(x_of(range.start as f64), area.top()), pos2(x_of(range.end as f64), area.bottom()));
+            painter.rect_filled(rect, CornerRadius::ZERO, RANGE);
+        }
+        let marker = |frame: Frames, color: Color32| {
+            let x = x_of(frame as f64);
+            painter.line_segment([pos2(x, area.top()), pos2(x, area.bottom())], Stroke::new(1.0, color));
+        };
+        marker(selection.cursor, LABEL);
+        if let Some(playhead) = playhead {
+            marker(playhead, PLAYHEAD);
+        }
+
+        let window = self.overview_window(areas);
+        painter.rect_filled(window, CornerRadius::same(3), OVERVIEW_WINDOW);
+        painter.rect_stroke(window, CornerRadius::same(3), Stroke::new(1.5, CURSOR), StrokeKind::Inside);
+        // Grips show that the edges can be dragged to show more or less.
+        for x in [window.left(), window.right()] {
+            let grip = Rect::from_center_size(pos2(x, window.center().y), vec2(5.0, 20.0));
+            painter.rect_filled(grip, CornerRadius::same(2), CURSOR);
+        }
+    }
+
     fn clip_header_at<'a>(&self, areas: &Areas, project: &'a Project, pos: Pos2) -> Option<&'a Clip> {
         if !areas.lane.contains(pos) {
             return None;
@@ -729,40 +1108,6 @@ impl Timeline {
                 && pos.y >= rect.top()
                 && pos.y < rect.top() + CLIP_HEADER_HEIGHT
         })
-    }
-
-    fn scrollbar_thumb(&self, areas: &Areas) -> Rect {
-        let track = areas.scrollbar;
-        let width = track.width() as f64;
-        let visible = self.width * self.view.frames_per_point;
-        let thumb_width = (visible / self.extent * width).clamp(24.0_f64.min(width), width);
-        let travel = width - thumb_width;
-        let scrollable = (self.extent - visible).max(1.0);
-        let left = track.left() as f64 + self.view.scroll / scrollable * travel;
-        Rect::from_min_size(
-            pos2(left as f32, track.top()),
-            vec2(thumb_width as f32, track.height()),
-        )
-    }
-
-    fn scrollbar_grab(&self, areas: &Areas, x: f32) -> f64 {
-        let thumb = self.scrollbar_thumb(areas);
-        if thumb.x_range().contains(x) {
-            (x - thumb.left()) as f64
-        } else {
-            thumb.width() as f64 / 2.0
-        }
-    }
-
-    fn drag_scrollbar(&mut self, areas: &Areas, x: f32, grab: f64) {
-        let thumb = self.scrollbar_thumb(areas);
-        let travel = (areas.scrollbar.width() - thumb.width()) as f64;
-        if travel <= 0.0 {
-            return;
-        }
-        let visible = self.width * self.view.frames_per_point;
-        let fraction = (x as f64 - areas.scrollbar.left() as f64 - grab) / travel;
-        self.view.scroll = fraction * (self.extent - visible);
     }
 
     fn paint_clip(&self, painter: &Painter, areas: &Areas, project: &Project, clip: &Clip, selected: bool) {
@@ -882,11 +1227,6 @@ impl Timeline {
         }
     }
 
-    fn paint_scrollbar(&self, painter: &Painter, areas: &Areas) {
-        painter.rect_filled(areas.scrollbar, CornerRadius::ZERO, SCROLL_TRACK);
-        let thumb = self.scrollbar_thumb(areas).shrink2(vec2(0.0, 2.0));
-        painter.rect_filled(thumb, CornerRadius::same(4), SCROLL_THUMB);
-    }
 }
 
 #[cfg(test)]

@@ -87,9 +87,18 @@ impl AboutWindow {
 }
 
 fn load_logo(ctx: &egui::Context) -> egui::TextureHandle {
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/logo/exports/kantan_64.png"))
-        .expect("the embedded logo is a valid PNG");
-    let image = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
+    const PNG: &[u8] = include_bytes!("../assets/logo/exports/kantan_64.png");
+    #[cfg(not(target_arch = "wasm32"))]
+    let (size, rgba) = {
+        let icon = eframe::icon_data::from_png_bytes(PNG).expect("the embedded logo is a valid PNG");
+        ([icon.width as usize, icon.height as usize], icon.rgba)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let (size, rgba) = {
+        let icon = image::load_from_memory(PNG).expect("the embedded logo is a valid PNG").to_rgba8();
+        ([icon.width() as usize, icon.height() as usize], icon.into_raw())
+    };
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
     ctx.load_texture("about_logo", image, egui::TextureOptions::LINEAR)
 }
 
@@ -111,6 +120,11 @@ fn about_page(ui: &mut egui::Ui, logo: egui::TextureId, max_height: f32) {
         ui.add_space(6.0);
         ui.label(RichText::new("Open-source components").strong());
         for (name, licence, role) in COMPONENTS {
+            // The browser version leaves out the C encoders and temp files.
+            let desktop_only = ["LAME", "vorbis", "tempfile"].iter().any(|part| name.contains(part));
+            if cfg!(target_arch = "wasm32") && desktop_only {
+                continue;
+            }
             ui.label(format!("{name} ({licence}): {role}"));
         }
     });

@@ -14,7 +14,8 @@ You need [Rust](https://rustup.rs) and Visual Studio's C++ build tools.
 
 - `run.bat` builds and opens the app.
 - `build-release.bat` writes the optimized app to `dist\`. It needs Python to find the build folder.
-- `cargo test --features bridge` runs all the tests. `CLAUDE.md` explains the headless UI driver they use.
+- `build-web.bat` builds the browser version into `dist-web\KantanAudioManager-web.zip`, ready to upload to itch.io as an HTML5 project. It needs the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` at the same version as the project's `wasm-bindgen`. The browser version exports WAV only, as one ZIP, and has no system audio recording or crash recovery.
+- `cargo test --features bridge` runs all the tests, including UI tests through `kantan-bridge`, a headless driver for the app; `kantan-bridge --help` lists its commands.
 
 ## Licence
 

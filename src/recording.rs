@@ -1,5 +1,7 @@
 //! Records takes from a microphone. Audio goes straight to a temp file as well
 //! as memory, so a crash can't lose a take, and is mono, which suits voice work.
+// The browser version records through web_mic instead of the desktop audio devices.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +38,10 @@ impl InputChoice {
 
 /// Microphones first, then each output device's system audio.
 pub fn input_choices() -> Vec<InputChoice> {
+    // A browser can only offer the microphone it asks permission for.
+    if cfg!(target_arch = "wasm32") {
+        return Vec::new();
+    }
     let host = cpal::default_host();
     let names = |devices: Result<Vec<cpal::Device>, _>| -> Vec<String> {
         let devices: Vec<cpal::Device> = devices.unwrap_or_default();
@@ -73,6 +79,92 @@ fn temp_path() -> Option<PathBuf> {
     Some(dir.join(format!("take-{}-{number}.wav", std::process::id())))
 }
 
+/// Collects a take as audio arrives: in memory, in a temp file where there is
+/// one, and as levels for the live preview.
+struct TakeWriter {
+    channels: usize,
+    rate: u32,
+    samples: Vec<f32>,
+    per_peak: usize,
+    peaked: usize,
+    path: Option<PathBuf>,
+    file: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
+    unflushed: usize,
+    frames: Arc<AtomicU64>,
+    live: Arc<Mutex<Vec<(f32, f32)>>>,
+}
+
+impl TakeWriter {
+    fn new(channels: usize, rate: u32, frames: Arc<AtomicU64>, live: Arc<Mutex<Vec<(f32, f32)>>>) -> Self {
+        let path = temp_path();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        // Without a temp file the take is still kept in memory, only less crash-safe.
+        let file = path.as_ref().and_then(|p| hound::WavWriter::create(p, spec).ok());
+        Self {
+            channels,
+            rate,
+            samples: Vec::new(),
+            per_peak: live_frames_per_peak(rate),
+            peaked: 0,
+            path,
+            file,
+            unflushed: 0,
+            frames,
+            live,
+        }
+    }
+
+    fn push(&mut self, chunk: &[f32]) {
+        let start = self.samples.len();
+        self.samples.extend(downmix(chunk, self.channels));
+        if let Some(writer) = &mut self.file {
+            for &sample in &self.samples[start..] {
+                let _ = writer.write_sample(sample);
+            }
+            self.unflushed += self.samples.len() - start;
+            // Flushing updates the header, leaving a readable file after a crash.
+            if self.unflushed >= self.rate as usize {
+                let _ = writer.flush();
+                self.unflushed = 0;
+            }
+        }
+        // Levels for the live preview, in whole steps so old ones never change.
+        if self.samples.len() >= self.peaked + self.per_peak {
+            let mut levels = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            while self.samples.len() >= self.peaked + self.per_peak {
+                let step = &self.samples[self.peaked..self.peaked + self.per_peak];
+                levels.push(step.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &s| (lo.min(s), hi.max(s))));
+                self.peaked += self.per_peak;
+            }
+        }
+        self.frames.store(self.samples.len() as u64, Ordering::Relaxed);
+    }
+
+    /// Builds the finished take at the project's rate.
+    fn finish(mut self, project_rate: u32) -> Result<Source, String> {
+        drop(self.file.take());
+        let result = if self.samples.is_empty() {
+            Err("the take has no audio".to_owned())
+        } else {
+            resample(&self.samples, 1, self.rate, project_rate)
+                .map_err(|e| e.to_string())
+                .and_then(|out| Source::new(1, out).map_err(|e| e.to_string()))
+        };
+        // A failed take with audio keeps its file, as the only copy of that audio.
+        if let Some(path) = &self.path
+            && (result.is_ok() || self.samples.is_empty())
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+}
+
 /// Runs on its own thread until the input ends, then builds the finished take.
 fn write_take(
     chunks: Receiver<Vec<f32>>,
@@ -82,66 +174,26 @@ fn write_take(
     frames: Arc<AtomicU64>,
     live: Arc<Mutex<Vec<(f32, f32)>>>,
 ) -> Result<Source, String> {
-    let per_peak = live_frames_per_peak(rate);
-    let mut peaked = 0;
-    let path = temp_path();
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    // Without a temp file the take is still kept in memory, only less crash-safe.
-    let mut file = path.as_ref().and_then(|p| hound::WavWriter::create(p, spec).ok());
-
-    let mut samples = Vec::new();
-    let mut unflushed = 0;
+    let mut writer = TakeWriter::new(channels, rate, frames, live);
     for chunk in chunks {
-        let start = samples.len();
-        samples.extend(downmix(&chunk, channels));
-        if let Some(writer) = &mut file {
-            for &sample in &samples[start..] {
-                let _ = writer.write_sample(sample);
-            }
-            unflushed += samples.len() - start;
-            // Flushing updates the header, leaving a readable file after a crash.
-            if unflushed >= rate as usize {
-                let _ = writer.flush();
-                unflushed = 0;
-            }
-        }
-        // Levels for the live preview, in whole steps so old ones never change.
-        if samples.len() >= peaked + per_peak {
-            let mut levels = live.lock().unwrap_or_else(|e| e.into_inner());
-            while samples.len() >= peaked + per_peak {
-                let step = &samples[peaked..peaked + per_peak];
-                levels.push(step.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &s| (lo.min(s), hi.max(s))));
-                peaked += per_peak;
-            }
-        }
-        frames.store(samples.len() as u64, Ordering::Relaxed);
+        writer.push(&chunk);
     }
-    drop(file);
-
-    let result = if samples.is_empty() {
-        Err("the take has no audio".to_owned())
-    } else {
-        resample(&samples, 1, rate, project_rate)
-            .map_err(|e| e.to_string())
-            .and_then(|out| Source::new(1, out).map_err(|e| e.to_string()))
-    };
-    // A failed take with audio keeps its file, as the only copy of that audio.
-    if let Some(path) = &path
-        && (result.is_ok() || samples.is_empty())
-    {
-        let _ = std::fs::remove_file(path);
-    }
-    result
+    writer.finish(project_rate)
 }
+
+/// What keeps the input running; dropping it stops recording.
+#[cfg(not(target_arch = "wasm32"))]
+type Capture = InputStreams;
+#[cfg(target_arch = "wasm32")]
+type Capture = web_mic::WebInput;
 
 struct Active {
     /// Stops the input when dropped, which ends the writer thread.
-    _stream: Option<InputStreams>,
+    _stream: Option<Capture>,
+    /// In the browser there's no writer thread, so the take is written here,
+    /// a frame at a time.
+    #[cfg(target_arch = "wasm32")]
+    inline_writer: Option<(Receiver<Vec<f32>>, TakeWriter, u32)>,
     simulated: Option<Sender<Vec<f32>>>,
     channels: usize,
     rate: u32,
@@ -155,12 +207,21 @@ pub struct Recorder {
     use_device: bool,
     active: Option<Active>,
     finishing: Option<Receiver<Result<Source, String>>>,
+    /// Where the browser version delivers its finished take.
+    #[cfg(target_arch = "wasm32")]
+    inline_done: Option<Sender<Result<Source, String>>>,
 }
 
 impl Recorder {
     /// `use_device` is false to take simulated input from `feed`.
     pub fn new(use_device: bool) -> Self {
-        Self { use_device, active: None, finishing: None }
+        Self {
+            use_device,
+            active: None,
+            finishing: None,
+            #[cfg(target_arch = "wasm32")]
+            inline_done: None,
+        }
     }
 
     pub fn is_recording(&self) -> bool {
@@ -205,7 +266,13 @@ impl Recorder {
         let frames = Arc::new(AtomicU64::new(0));
 
         let (stream, simulated, channels, rate) = if self.use_device {
+            #[cfg(not(target_arch = "wasm32"))]
             let (stream, channels, rate) = open_input(device, sender, peak.clone(), lost.clone())?;
+            #[cfg(target_arch = "wasm32")]
+            let (stream, channels, rate) = {
+                let _ = device;
+                web_mic::open(sender, peak.clone(), lost.clone())?
+            };
             (Some(stream), None, channels, rate)
         } else {
             (None, Some(sender), 1, SIMULATED_RATE)
@@ -215,16 +282,51 @@ impl Recorder {
         let writer_frames = frames.clone();
         let live = Arc::new(Mutex::new(Vec::new()));
         let writer_live = live.clone();
-        std::thread::spawn(move || {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::run_in_background(move || {
             let _ = done.send(write_take(chunks, channels, rate, project_rate, writer_frames, writer_live));
         });
+        #[cfg(target_arch = "wasm32")]
+        let inline_writer = {
+            self.inline_done = Some(done);
+            Some((chunks, TakeWriter::new(channels, rate, writer_frames, writer_live), project_rate))
+        };
         self.finishing = Some(finishing);
-        self.active = Some(Active { _stream: stream, simulated, channels, rate, frames, peak, lost, live });
+        self.active = Some(Active {
+            _stream: stream,
+            #[cfg(target_arch = "wasm32")]
+            inline_writer,
+            simulated,
+            channels,
+            rate,
+            frames,
+            peak,
+            lost,
+            live,
+        });
         Ok(())
+    }
+
+    /// In the browser, writes the audio that arrived since the last frame.
+    /// On the desktop a thread does this, so it does nothing.
+    pub fn pump(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(Active { inline_writer: Some((chunks, writer, _)), .. }) = &mut self.active {
+            while let Ok(chunk) = chunks.try_recv() {
+                writer.push(&chunk);
+            }
+        }
     }
 
     /// Ends the take. `poll_finished` then delivers it.
     pub fn stop(&mut self) {
+        self.pump();
+        #[cfg(target_arch = "wasm32")]
+        if let Some(Active { inline_writer: Some((_, writer, project_rate)), .. }) = self.active.take()
+            && let Some(done) = self.inline_done.take()
+        {
+            let _ = done.send(writer.finish(project_rate));
+        }
         self.active = None;
     }
 
@@ -254,6 +356,96 @@ impl Recorder {
 fn store_peak(peak: &AtomicU32, level: f32) {
     if level > f32::from_bits(peak.load(Ordering::Relaxed)) {
         peak.store(level.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// The browser's microphone, through `getUserMedia`.
+#[cfg(target_arch = "wasm32")]
+mod web_mic {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::mpsc::Sender;
+    use std::sync::{Arc, Mutex};
+
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+
+    /// Dropping this releases the microphone.
+    pub struct WebInput {
+        context: web_sys::AudioContext,
+        stream: Rc<RefCell<Option<web_sys::MediaStream>>>,
+        _on_audio: Closure<dyn FnMut(web_sys::AudioProcessingEvent)>,
+    }
+
+    impl Drop for WebInput {
+        fn drop(&mut self) {
+            if let Some(stream) = self.stream.borrow_mut().take() {
+                for track in stream.get_tracks().iter() {
+                    if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
+                        track.stop();
+                    }
+                }
+            }
+            let _ = self.context.close();
+        }
+    }
+
+    /// Starts listening. The browser asks permission first, so audio starts a
+    /// moment later; a refusal arrives through `lost`.
+    pub fn open(
+        sender: Sender<Vec<f32>>,
+        peak: Arc<AtomicU32>,
+        lost: Arc<Mutex<Option<String>>>,
+    ) -> Result<(WebInput, usize, u32), String> {
+        let error = |e: wasm_bindgen::JsValue| format!("{e:?}");
+        let context = web_sys::AudioContext::new().map_err(error)?;
+        let rate = context.sample_rate() as u32;
+        let processor = context
+            .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(4096, 1, 1)
+            .map_err(error)?;
+        let on_audio = Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(move |event: web_sys::AudioProcessingEvent| {
+            if let Ok(buffer) = event.input_buffer()
+                && let Ok(data) = buffer.get_channel_data(0)
+            {
+                let loudest = data.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                super::store_peak(&peak, loudest);
+                let _ = sender.send(data);
+            }
+        });
+        processor.set_onaudioprocess(Some(on_audio.as_ref().unchecked_ref()));
+        // A silent path to the speakers, because browsers only run a processor that leads somewhere.
+        let mute = context.create_gain().map_err(error)?;
+        mute.gain().set_value(0.0);
+        processor.connect_with_audio_node(&mute).map_err(error)?;
+        mute.connect_with_audio_node(&context.destination()).map_err(error)?;
+
+        let stream = Rc::new(RefCell::new(None));
+        let navigator = web_sys::window().ok_or("no browser window")?.navigator();
+        let devices = navigator.media_devices().map_err(|_| "this browser can't record".to_owned())?;
+        let constraints = web_sys::MediaStreamConstraints::new();
+        constraints.set_audio(&wasm_bindgen::JsValue::TRUE);
+        let request = devices.get_user_media_with_constraints(&constraints).map_err(error)?;
+        let (held, connect_context) = (stream.clone(), context.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            match wasm_bindgen_futures::JsFuture::from(request).await {
+                Ok(value) => {
+                    let media: web_sys::MediaStream = value.unchecked_into();
+                    match connect_context.create_media_stream_source(&media) {
+                        Ok(source) => {
+                            let _ = source.connect_with_audio_node(&processor);
+                        }
+                        Err(e) => *lost.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!("{e:?}")),
+                    }
+                    *held.borrow_mut() = Some(media);
+                }
+                Err(_) => {
+                    *lost.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some("the browser didn't allow microphone access".to_owned());
+                }
+            }
+        });
+        Ok((WebInput { context, stream, _on_audio: on_audio }, 1, rate))
     }
 }
 
