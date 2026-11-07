@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Receiver};
 
 use eframe::egui::{self, Color32, Key, Modifiers};
 
+use crate::export_dialog::ExportDialog;
 use crate::import::{self, ImportError, SUPPORTED_EXTENSIONS};
 use crate::timeline::{Selection, Timeline, format_time};
 use crate::{Document, Project, Source};
@@ -26,6 +27,7 @@ pub struct App {
     error: Option<String>,
     native_dialogs: bool,
     blocked_dialogs: u32,
+    export: ExportDialog,
 }
 
 impl App {
@@ -42,6 +44,7 @@ impl App {
             error: None,
             native_dialogs: true,
             blocked_dialogs: 0,
+            export: ExportDialog::default(),
         };
         if !startup_files.is_empty() {
             app.start_import(ctx, startup_files);
@@ -75,6 +78,22 @@ impl App {
 
     pub fn is_importing(&self) -> bool {
         self.importing.is_some()
+    }
+
+    pub fn export_dialog(&self) -> &ExportDialog {
+        &self.export
+    }
+
+    pub fn export_dialog_mut(&mut self) -> &mut ExportDialog {
+        &mut self.export
+    }
+
+    fn open_export(&mut self) {
+        if self.document.project().clips().is_empty() {
+            self.error = Some("There are no clips to export.".to_owned());
+            return;
+        }
+        self.export.open(!self.selection.clips.is_empty());
     }
 
     pub fn blocked_dialogs(&self) -> u32 {
@@ -174,6 +193,9 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z)) {
             self.document.undo();
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::E)) {
+            self.open_export();
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
             self.pick_files(ctx);
         }
@@ -190,6 +212,9 @@ impl App {
             let ctx = ui.ctx().clone();
             if ui.button("Import").on_hover_text("Import audio files (Ctrl+O)").clicked() {
                 self.pick_files(&ctx);
+            }
+            if ui.button("Export").on_hover_text("Export clips to files (Ctrl+E)").clicked() {
+                self.open_export();
             }
             ui.separator();
 
@@ -280,8 +305,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.finish_import();
-        self.handle_dropped_files(&ctx);
-        self.handle_hotkeys(&ctx);
+        // The export window is modal, and its text boxes need keys like Ctrl+A.
+        if !self.export.open {
+            self.handle_dropped_files(&ctx);
+            self.handle_hotkeys(&ctx);
+        }
         self.selection.retain_existing(self.document.project());
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
@@ -293,6 +321,13 @@ impl eframe::App for App {
                 self.timeline.show(ui, self.document.project(), &mut self.selection);
                 self.paint_overlay(&ctx, rect, ui.painter());
             });
+        self.export.show(
+            &ctx,
+            self.document.project(),
+            &self.selection.clips,
+            self.native_dialogs,
+            &mut self.blocked_dialogs,
+        );
     }
 }
 

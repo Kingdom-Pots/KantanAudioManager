@@ -6,6 +6,8 @@
 //! those lists and undo snapshots stay cheap.
 
 pub mod app;
+pub mod export;
+pub mod export_dialog;
 pub mod history;
 pub mod import;
 pub mod peaks;

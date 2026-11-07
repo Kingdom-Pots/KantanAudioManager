@@ -128,7 +128,7 @@ fn reduce_channels(channels: usize, samples: Vec<f32>) -> (usize, Vec<f32>) {
 
 /// Converts interleaved audio to another rate, returning exactly the number of
 /// frames that length should have at the new rate.
-fn resample(
+pub(crate) fn resample(
     samples: &[f32],
     channels: usize,
     from: u32,

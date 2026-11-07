@@ -12,6 +12,7 @@ use eframe::egui::{self, Modifiers, MouseWheelSource, MouseWheelUnit, PointerBut
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use kantan_audio_manager::app::App;
+use kantan_audio_manager::export::{BitDepth, FileProblem, NumberPosition};
 use kantan_audio_manager::peaks::clip_min_max;
 use serde_json::json;
 
@@ -32,6 +33,11 @@ Commands, one per line. # starts a comment, and \"quotes\" allow spaces.
   scrollbar POINTS           Drag the scrollbar thumb sideways
   click X Y [MODS]           Click at a position, in points
   drag X1 Y1 X2 Y2 [MODS]    Drag between positions, in points
+  export KEY VALUE           Set an option in the open export window:
+                             folder, prefix, suffix, rate, overwrite on|off,
+                             bits 16|24, scope all|selected,
+                             numbering off|before|after, start, digits
+  export-wait                Wait for a running export to finish
   state                      Print the app's state as one line of JSON
   screenshot PATH            Render the window to a PNG file
 
@@ -58,6 +64,8 @@ enum Command {
     Scrollbar(f32),
     Click(Pos2, Modifiers),
     Drag(Pos2, Pos2, Modifiers),
+    ExportSet(String, String),
+    ExportWait,
     State,
     Screenshot(PathBuf),
 }
@@ -161,6 +169,8 @@ fn parse(line: &str) -> Result<Option<Command>, String> {
             pos2(number(x2)?, number(y2)?),
             optional_mods(rest.first())?,
         ),
+        ("export", [key, value]) => Command::ExportSet(key.clone(), value.clone()),
+        ("export-wait", []) => Command::ExportWait,
         ("state", []) => Command::State,
         ("screenshot", [path]) => Command::Screenshot(PathBuf::from(path)),
         (other, _) => return Err(format!("unknown command or wrong arguments: '{other}'")),
@@ -358,12 +368,61 @@ impl Bridge {
             }
             Command::Click(pos, modifiers) => self.click(pos, modifiers),
             Command::Drag(from, to, modifiers) => self.drag(from, to, modifiers),
+            Command::ExportSet(key, value) => {
+                self.export_set(&key, &value)?;
+                self.settle();
+            }
+            Command::ExportWait => {
+                let started = Instant::now();
+                self.harness.step();
+                while self.harness.state().export_dialog().is_running() {
+                    if started.elapsed() > IMPORT_TIMEOUT {
+                        return Err("timed out waiting for the export".to_owned());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    self.harness.step();
+                }
+                self.settle();
+            }
             Command::State => println!("{}", self.state()),
             Command::Screenshot(path) => {
                 let image = self.harness.render()?;
                 image.save(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                 println!("{}", json!({ "screenshot": path }));
             }
+        }
+        Ok(())
+    }
+
+    fn export_set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let dialog = self.harness.state_mut().export_dialog_mut();
+        if !dialog.open {
+            return Err("the export window isn't open".to_owned());
+        }
+        let s = &mut dialog.settings;
+        match (key, value) {
+            ("folder", _) => s.folder = Some(PathBuf::from(value)),
+            ("prefix", _) => s.names.prefix = value.to_owned(),
+            ("suffix", _) => s.names.suffix = value.to_owned(),
+            ("rate", _) => s.sample_rate = number(value)?,
+            ("bits", "16") => s.depth = BitDepth::Bits16,
+            ("bits", "24") => s.depth = BitDepth::Bits24,
+            ("scope", "all") => s.only_selected = false,
+            ("scope", "selected") => s.only_selected = true,
+            ("overwrite", "on") => s.overwrite = true,
+            ("overwrite", "off") => s.overwrite = false,
+            ("numbering", "off") => s.numbering_enabled = false,
+            ("numbering", "before") => {
+                s.numbering_enabled = true;
+                s.number_position = NumberPosition::BeforeName;
+            }
+            ("numbering", "after") => {
+                s.numbering_enabled = true;
+                s.number_position = NumberPosition::AfterName;
+            }
+            ("start", _) => s.number_start = number(value)?,
+            ("digits", _) => s.number_padding = number(value)?,
+            _ => return Err(format!("bad value '{value}' for {key}")),
         }
         Ok(())
     }
@@ -395,7 +454,32 @@ impl Bridge {
             })
             .collect();
 
+        let dialog = app.export_dialog();
+        let files: Vec<_> = dialog
+            .plan(project, &selection.clips)
+            .iter()
+            .map(|file| {
+                json!({
+                    "name": file.file_name,
+                    "problem": file.problem.map(|p| match p {
+                        FileProblem::Duplicate => "duplicate",
+                        FileProblem::Exists => "exists",
+                    }),
+                    "sanitized": file.sanitized,
+                })
+            })
+            .collect();
+        let report = dialog.report().map(|r| {
+            json!({ "written": r.written, "failed": r.failed, "clipped": r.clipped })
+        });
+
         json!({
+            "export": {
+                "open": dialog.open,
+                "running": dialog.is_running(),
+                "files": files,
+                "report": report,
+            },
             "sample_rate": project.sample_rate(),
             "clips": clips,
             "cursor": seconds(selection.cursor),

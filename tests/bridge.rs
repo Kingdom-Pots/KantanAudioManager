@@ -227,3 +227,86 @@ fn errors_name_the_line_and_stop_the_script() {
     assert!(stderr.contains("line 3") && stderr.contains("missing"), "{stderr}");
     assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
 }
+
+/// A folder the export tests write into.
+fn export_folder(samples: &Samples) -> String {
+    samples.0.join("out").display().to_string()
+}
+
+fn files(state: &Value) -> Vec<&str> {
+    state["export"]["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect()
+}
+
+#[test]
+fn exporting_writes_named_wavs_in_timeline_order() {
+    let samples = Samples::new("export");
+    let out = export_folder(&samples);
+    let states = run(&format!(
+        "{}\nkey ctrl+e\nexport folder \"{out}\"\nexport prefix VO_\nexport suffix _final\nexport numbering before\nexport rate 44100\nexport bits 24\nstate\nbutton \"Export files\"\nexport-wait\nstate\n",
+        samples.import_line("import"),
+    ));
+    let expected = [
+        "VO_001_intro_final.wav",
+        "VO_002_line1_final.wav",
+        "VO_003_line2_final.wav",
+        "VO_004_line10_final.wav",
+    ];
+    assert_eq!(files(&states[0]), expected);
+    assert_eq!(states[1]["export"]["report"]["written"], 4);
+
+    let reader = hound::WavReader::open(samples.0.join("out").join(expected[0])).unwrap();
+    assert_eq!(reader.spec().sample_rate, 44100);
+    assert_eq!(reader.spec().bits_per_sample, 24);
+    assert_eq!(reader.duration(), 88200);
+
+    // After exporting, the same names now exist, so a repeat must be blocked.
+    assert_eq!(states[1]["export"]["files"][0]["problem"], "exists");
+}
+
+#[test]
+fn export_only_covers_selected_clips_and_renumbers_them() {
+    let samples = Samples::new("selected");
+    let out = export_folder(&samples);
+    let states = run(&format!(
+        "{}\nclip line2\nclip line10 ctrl\nkey ctrl+e\nexport folder \"{out}\"\nexport numbering after\nexport digits 2\nstate\nexport scope all\nstate\n",
+        samples.import_line("import")
+    ));
+    assert_eq!(files(&states[0]), ["line2_01.wav", "line10_02.wav"]);
+    assert_eq!(files(&states[1]).len(), 4);
+}
+
+#[test]
+fn problems_block_export_until_resolved() {
+    let samples = Samples::new("blocked");
+    let out = samples.0.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("intro.wav"), b"keep me").unwrap();
+    let states = run(&format!(
+        "{}\nkey ctrl+e\nbutton \"Export files\"\nexport-wait\nstate\nexport folder \"{}\"\nbutton \"Export files\"\nexport-wait\nstate\nexport overwrite on\nbutton \"Export files\"\nexport-wait\nstate\n",
+        samples.import_line("import"),
+        out.display(),
+    ));
+    // No folder, then an existing file: nothing is written either time.
+    assert_eq!(states[0]["export"]["report"], Value::Null);
+    assert_eq!(states[1]["export"]["report"], Value::Null);
+    assert_eq!(states[1]["export"]["files"][0]["problem"], "exists");
+    // Overwriting allowed.
+    assert_eq!(states[2]["export"]["report"]["written"], 4);
+    assert!(hound::WavReader::open(out.join("intro.wav")).is_ok());
+}
+
+#[test]
+fn export_window_owns_the_keyboard_and_escape_closes_it() {
+    let samples = Samples::new("modal");
+    let states = run(&format!(
+        "{}\nkey ctrl+e\nkey ctrl+z\nkey ctrl+a\nstate\nkey escape\nstate\nkey ctrl+z\nkey ctrl+e\nstate\n",
+        samples.import_line("import")
+    ));
+    assert_eq!(names(&states[0]).len(), 4, "undo must not run behind the window");
+    assert!(selected(&states[0]).is_empty());
+    assert_eq!(states[0]["export"]["open"], true);
+    assert_eq!(states[1]["export"]["open"], false);
+    // With no clips left, the window refuses to open and says why.
+    assert_eq!(states[2]["export"]["open"], false);
+    assert!(states[2]["error"].as_str().unwrap().contains("no clips"));
+}
