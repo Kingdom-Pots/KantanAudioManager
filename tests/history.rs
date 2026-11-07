@@ -156,7 +156,7 @@ fn random_edits_stay_valid_and_fully_undo() {
                             None => Err(EditError::ClipsNotAdjacent),
                         }
                     }
-                    3 => p.move_clip(clip?, position),
+                    3 => p.move_clip(clip?, position, 0),
                     4 => p.rename_clip(clip?, "renamed"),
                     5 => p.delete_clips(&[clip?]),
                     _ => p.amplify(TimeRange::new(position, other_position), 1.5),

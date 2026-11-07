@@ -1654,6 +1654,7 @@ dependencies = [
  "rubato",
  "serde_json",
  "symphonia",
+ "tempfile",
  "vorbis_rs",
  "winresource",
 ]

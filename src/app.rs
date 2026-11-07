@@ -15,7 +15,7 @@ use crate::project_file;
 use crate::session::{self, Orphans, Session};
 use crate::peaks::clip_min_max;
 use crate::recording::{self, Recorder};
-use crate::timeline::{Selection, Timeline, TimelineAction, format_time};
+use crate::timeline::{LivePreview, Selection, Timeline, TimelineAction, format_time};
 use crate::{SilenceSettings, Frames, ClipId, Document, EditError, Project, Source, TimeRange, db_to_gain};
 
 const PROJECT_RATE: u32 = 48000;
@@ -621,9 +621,9 @@ impl App {
 
     /// Adds finished takes, and keeps what was captured if the mic disappears.
     fn update_recording(&mut self, ctx: &egui::Context) {
-        if self.recorder.device_lost() {
+        if let Some(reason) = self.recorder.device_lost() {
             self.recorder.stop();
-            self.error = Some("The recording input stopped working. The take so far was kept.".to_owned());
+            self.error = Some(format!("The recording input stopped working ({reason}). The take so far was kept."));
         }
         if self.recorder.is_recording() {
             self.meter = self.recorder.take_level().max(self.meter * 0.9);
@@ -668,11 +668,17 @@ impl App {
             self.toggle_recording();
         }
         let current = self.input.as_ref().map_or_else(|| "Default mic".to_owned(), |i| i.label());
+        // Device names can be very long, and mustn't push the other buttons along.
+        let shown = if current.chars().count() > 24 {
+            current.chars().take(23).chain(['\u{2026}']).collect()
+        } else {
+            current.clone()
+        };
         ui.add_enabled_ui(!recording, |ui| {
             ui.label(egui::RichText::new(icons::MICROPHONE).size(ICON_SIZE))
                 .on_hover_text("The recording input");
             egui::ComboBox::from_id_salt("recording_input")
-                .selected_text(current)
+                .selected_text(shown)
                 .width(150.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.input, None, "Default mic")
@@ -688,7 +694,7 @@ impl App {
                     }
                 })
                 .response
-                .on_hover_text("Choose what to record from: a microphone, or system audio");
+                .on_hover_text(format!("Recording from: {current}. Choose a microphone, or system audio."));
         });
         if recording {
             let (rect, meter) = ui.allocate_exact_size(egui::vec2(80.0, 12.0), egui::Sense::hover());
@@ -724,8 +730,18 @@ impl App {
             self.error = Some("There is nothing to play.".to_owned());
             return;
         };
+        // Selected clips play as a region, from the cursor if it's inside them.
+        let cursor = self.selection.cursor;
+        let selected = self.selection.clips.iter().filter_map(|&id| project.clip(id));
+        let span = selected.fold(None, |span: Option<(Frames, Frames)>, clip| {
+            Some(span.map_or((clip.start, clip.end()), |(a, b)| (a.min(clip.start), b.max(clip.end()))))
+        });
         let (from, to) = match self.selection.range {
             Some(range) => (range.start, range.end),
+            None if span.is_some() => {
+                let (start, end) = span.unwrap_or((0, track_end));
+                (if cursor >= start && cursor < end { cursor } else { start }, end)
+            }
             // Starting past the end would be silent, so go back to the start.
             None if self.selection.cursor >= track_end => (0, track_end),
             None => (self.selection.cursor, track_end),
@@ -870,8 +886,8 @@ impl App {
 
     fn run_action(&mut self, action: TimelineAction) {
         match action {
-            TimelineAction::Move(id, start) => {
-                let result = self.document.edit("Move", |project| project.move_clip(id, start));
+            TimelineAction::Move(id, start, snap) => {
+                let result = self.document.edit("Move", |project| project.move_clip(id, start, snap));
                 self.report(result);
             }
             TimelineAction::Rename(id) => self.open_rename(id),
@@ -1256,7 +1272,14 @@ impl eframe::App for App {
         // The export window is modal, and its text boxes need keys like Ctrl+A.
         self.update_window(&ctx);
         self.update_autosave();
-        if !self.export.open && self.dialog.is_none() && self.prompt.is_none() && !self.about.is_open() {
+        // An open menu gets the keys first, so Esc closes it and Del can't act behind it.
+        let menu_open = egui::Popup::is_any_open(&ctx);
+        if !self.export.open
+            && self.dialog.is_none()
+            && self.prompt.is_none()
+            && !self.about.is_open()
+            && !menu_open
+        {
             self.handle_dropped_files(&ctx);
             self.handle_hotkeys(&ctx);
         }
@@ -1272,7 +1295,25 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 let playhead = self.player.position();
-                action = self.timeline.show(ui, self.document.project(), &mut self.selection, playhead);
+                let project = self.document.project();
+                let (timeline, selection) = (&mut self.timeline, &mut self.selection);
+                let seconds = self.recorder.seconds();
+                let shown = self.recorder.with_live_levels(|levels| {
+                    let rate = project.sample_rate() as f64;
+                    let name = project.next_recording_name();
+                    let live = LivePreview {
+                        name: &name,
+                        start: project.next_take_start(),
+                        len: (seconds * rate) as Frames,
+                        levels,
+                        frames_per_level: rate / 100.0,
+                    };
+                    timeline.show(ui, project, selection, playhead, Some(live))
+                });
+                action = match shown {
+                    Some(action) => action,
+                    None => timeline.show(ui, project, selection, playhead, None),
+                };
                 self.paint_overlay(&ctx, rect, ui.painter());
             });
         if let Some(action) = action {

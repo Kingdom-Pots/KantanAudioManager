@@ -8,12 +8,14 @@ use eframe::egui::{self, Color32, RichText};
 use crate::export::{
     BitDepth, ExportReport, FileProblem, NameOptions, NumberPosition, Numbering, OutputFormat,
     PlannedFile,
-    export_clips, plan_files,
+    ExistingFiles, export_clips_with_policy, plan_files,
 };
 use crate::project_file::Settings;
 use crate::{ClipId, Project};
 
 const SAMPLE_RATES: [u32; 5] = [48000, 44100, 32000, 22050, 16000];
+/// A compact preview with room for a small batch.
+const PREVIEW_HEIGHT: f32 = 96.0;
 const PROBLEM: Color32 = Color32::from_rgb(240, 120, 110);
 const WARNING: Color32 = Color32::from_rgb(235, 190, 90);
 
@@ -58,7 +60,6 @@ pub struct ExportSettings {
     pub depth: BitDepth,
     pub format: FileFormat,
     pub only_selected: bool,
-    pub overwrite: bool,
 }
 
 impl ExportSettings {
@@ -144,11 +145,21 @@ impl ExportSettings {
     }
 }
 
+struct PendingExport {
+    project: Project,
+    folder: PathBuf,
+    files: Vec<(ClipId, PathBuf)>,
+    rate: u32,
+    format: OutputFormat,
+    conflicts: Vec<String>,
+}
+
 pub struct ExportDialog {
     pub open: bool,
     pub settings: ExportSettings,
     job: Option<Job>,
     report: Option<ExportReport>,
+    pending: Option<PendingExport>,
 }
 
 impl Default for ExportDialog {
@@ -166,10 +177,10 @@ impl Default for ExportDialog {
                 depth: BitDepth::Bits16,
                 format: FileFormat::Wav,
                 only_selected: false,
-                overwrite: false,
             },
             job: None,
             report: None,
+            pending: None,
         }
     }
 }
@@ -179,6 +190,7 @@ impl ExportDialog {
     pub fn open(&mut self, any_selected: bool) {
         self.open = true;
         self.report = None;
+        self.pending = None;
         self.settings.only_selected = any_selected;
     }
 
@@ -212,40 +224,50 @@ impl ExportDialog {
         })
     }
 
-    fn blocks_export(&self, file: &PlannedFile) -> bool {
-        match file.problem {
-            Some(FileProblem::Duplicate) => true,
-            Some(FileProblem::Exists) => !self.settings.overwrite,
-            None => false,
+    fn can_start(&self, plan: &[PlannedFile]) -> bool {
+        self.job.is_none()
+            && self.pending.is_none()
+            && self.settings.folder.is_some()
+            && !plan.is_empty()
+            && !plan.iter().any(|file| file.problem == Some(FileProblem::Duplicate))
+    }
+
+    pub fn awaiting_conflict(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn request_export(&mut self, ctx: &egui::Context, project: &Project, selected: &[ClipId], plan: &[PlannedFile]) {
+        let Some(folder) = self.settings.folder.clone() else { return };
+        let files = self.clips(project, selected).iter().zip(plan)
+            .map(|(clip, file)| (clip.id, folder.join(&file.file_name))).collect();
+        let pending = PendingExport {
+            project: project.clone(),
+            folder,
+            files,
+            rate: self.settings.sample_rate,
+            format: self.settings.output_format(),
+            conflicts: plan.iter().filter(|file| file.problem == Some(FileProblem::Exists))
+                .map(|file| file.file_name.clone()).collect(),
+        };
+        self.report = None;
+        if pending.conflicts.is_empty() {
+            self.start(ctx, pending, ExistingFiles::Refuse);
+        } else {
+            self.pending = Some(pending);
+            ctx.request_repaint();
         }
     }
 
-    fn can_start(&self, plan: &[PlannedFile]) -> bool {
-        self.job.is_none()
-            && self.settings.folder.is_some()
-            && !plan.is_empty()
-            && !plan.iter().any(|file| self.blocks_export(file))
-    }
-
-    /// Writes on a worker thread, using a snapshot of the project.
-    fn start(&mut self, ctx: &egui::Context, project: &Project, selected: &[ClipId], plan: &[PlannedFile]) {
-        let Some(folder) = self.settings.folder.clone() else { return };
-        let files: Vec<(ClipId, PathBuf)> = self
-            .clips(project, selected)
-            .iter()
-            .zip(plan)
-            .map(|(clip, file)| (clip.id, folder.join(&file.file_name)))
-            .collect();
-
+    /// Runs the confirmed snapshot on a worker.
+    fn start(&mut self, ctx: &egui::Context, pending: PendingExport, policy: ExistingFiles) {
+        let PendingExport { project, folder, files, rate, format, .. } = pending;
         let total = files.len();
-        let project = project.clone();
-        let (rate, format) = (self.settings.sample_rate, self.settings.output_format());
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         self.report = None;
         std::thread::spawn(move || {
             let report = match std::fs::create_dir_all(&folder) {
-                Ok(()) => export_clips(&project, &files, rate, format, |done| {
+                Ok(()) => export_clips_with_policy(&project, &files, rate, format, policy, |done| {
                     let _ = sender.send(JobMessage::Progress(done));
                     ctx.request_repaint();
                 }),
@@ -289,34 +311,139 @@ impl ExportDialog {
         if !self.open {
             return;
         }
-        let plan = self.plan(project, selected);
-
         let response = egui::Modal::new(egui::Id::unique("export_dialog")).show(ctx, |ui| {
-            ui.set_width(560.0);
+            ui.set_width(540.0);
             ui.heading("Export clips");
-            ui.add_space(4.0);
-            self.options_ui(ui, !selected.is_empty(), native_dialogs, blocked_dialogs);
-            ui.separator();
-            preview_ui(ui, &plan, self.settings.overwrite);
+            ui.weak("Create one audio file for each clip.");
+            ui.add_space(12.0);
+            let selected_count = project.clips().iter().filter(|clip| selected.contains(&clip.id)).count();
+            let mut plan = Vec::new();
+            egui::ScrollArea::vertical()
+                .id_salt("export_options")
+                .max_height((ctx.content_rect().height() - 140.0).max(80.0))
+                .show(ui, |ui| {
+                    ui.add_enabled_ui(self.job.is_none() && self.pending.is_none(), |ui| {
+                        self.options_ui(ui, project.clips().len(), selected_count, native_dialogs, blocked_dialogs);
+                    });
+                    ui.add_space(8.0);
+                    // Calculate after edits so the export always matches the preview.
+                    plan = self.plan(project, selected);
+                    preview_ui(ui, &plan);
+                    if let Some(report) = &self.report {
+                        ui.add_space(6.0);
+                        report_ui(ui, report);
+                    }
+                });
+            ui.add_space(8.0);
             ui.separator();
             self.footer_ui(ui, ctx, project, selected, &plan);
         });
 
-        if response.should_close() && self.job.is_none() {
+        if response.should_close() && self.job.is_none() && self.pending.is_none() {
             self.open = false;
+        }
+        if self.pending.is_some() {
+            let confirmation = egui::Modal::new(egui::Id::unique("export_conflict")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading("Files already exist");
+                ui.add_space(8.0);
+                self.conflict_ui(ui, ctx);
+            });
+            if confirmation.should_close() {
+                self.pending = None;
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn conflict_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let pending = self.pending.as_ref().unwrap();
+        let count = pending.conflicts.len();
+        ui.label(RichText::new(if count == 1 {
+            "A file with this name already exists.".to_owned()
+        } else {
+            format!("{count} files with matching names already exist.")
+        }).strong());
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
+            for name in &pending.conflicts {
+                ui.add(egui::Label::new(RichText::new(name).monospace()).truncate()).on_hover_text(name);
+            }
+        });
+        ui.add_space(10.0);
+        ui.weak("Replace matching files, or keep them and export numbered copies.");
+        ui.add_space(12.0);
+        let mut choice = None;
+        ui.horizontal(|ui| {
+            if ui.button("Replace existing").clicked() {
+                choice = Some(ExistingFiles::Replace);
+            }
+            if ui.button("Make copies").clicked() {
+                choice = Some(ExistingFiles::KeepBoth);
+            }
+            if ui.button("Cancel").clicked() {
+                self.pending = None;
+                ctx.request_repaint();
+            }
+        });
+        if let Some(policy) = choice {
+            let pending = self.pending.take().unwrap();
+            self.start(ctx, pending, policy);
         }
     }
 
     fn options_ui(
         &mut self,
         ui: &mut egui::Ui,
-        any_selected: bool,
+        clip_count: usize,
+        selected_count: usize,
         native_dialogs: bool,
         blocked_dialogs: &mut u32,
     ) {
         let s = &mut self.settings;
+        if selected_count == 0 {
+            s.only_selected = false;
+        }
+        ui.columns(2, |columns| {
+            let width = columns[0].available_width();
+            if columns[0].add_sized([width, 34.0], egui::Button::new(format!("All clips  ({clip_count})")).selected(!s.only_selected)).clicked() {
+                s.only_selected = false;
+            }
+            let width = columns[1].available_width();
+            if columns[1].add_enabled_ui(selected_count > 0, |ui| {
+                ui.add_sized([width, 34.0], egui::Button::new(format!("Selected clips  ({selected_count})")).selected(s.only_selected))
+            }).inner.clicked() {
+                s.only_selected = true;
+            }
+        });
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).inner_margin(12).corner_radius(8).show(ui, |ui| {
+            ui.columns(2, |columns| {
+                columns[0].label(RichText::new("Prefix").strong());
+                columns[0].add(egui::TextEdit::singleline(&mut s.names.prefix).desired_width(f32::INFINITY).hint_text("Before the clip name"));
+                columns[1].label(RichText::new("Suffix").strong());
+                columns[1].add(egui::TextEdit::singleline(&mut s.names.suffix).desired_width(f32::INFINITY).hint_text("After the clip name"));
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Format").strong());
+                egui::ComboBox::from_id_salt("file_format").selected_text(s.format.label()).width(100.0)
+                    .show_ui(ui, |ui| {
+                        for format in [FileFormat::Wav, FileFormat::Mp3, FileFormat::Ogg] {
+                            ui.selectable_value(&mut s.format, format, format.label());
+                        }
+                    });
+                ui.weak(match s.format {
+                    FileFormat::Wav => "Uncompressed audio",
+                    FileFormat::Mp3 => "Smaller files · 192 kbps",
+                    FileFormat::Ogg => "Smaller files · Vorbis quality 6",
+                });
+            });
+        });
+        ui.add_space(10.0);
+        ui.label(RichText::new("Destination").strong());
         ui.horizontal(|ui| {
-            if ui.button("Folder...").on_hover_text("Choose where the files go").clicked() {
+            if ui.button("Choose folder…").on_hover_text("Choose where the files go").clicked() {
                 if native_dialogs {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         s.folder = Some(folder);
@@ -325,95 +452,49 @@ impl ExportDialog {
                     *blocked_dialogs += 1;
                 }
             }
-            match &s.folder {
-                // Long paths and names must not stretch the window off screen.
-                Some(folder) => {
-                    let path = folder.display().to_string();
-                    ui.add(egui::Label::new(&path).truncate()).on_hover_text(&path)
+            if let Some(folder) = &s.folder {
+                let path = folder.display().to_string();
+                ui.add(egui::Label::new(&path).truncate()).on_hover_text(&path);
+            } else {
+                ui.weak("Choose where to save your files");
+            }
+        });
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Advanced options").default_open(false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Sample rate");
+                egui::ComboBox::from_id_salt("sample_rate").selected_text(format!("{} Hz", s.sample_rate))
+                    .show_ui(ui, |ui| {
+                        for rate in SAMPLE_RATES {
+                            ui.selectable_value(&mut s.sample_rate, rate, format!("{rate} Hz"));
+                        }
+                    });
+                if s.format == FileFormat::Wav {
+                    ui.label("Bit depth");
+                    egui::ComboBox::from_id_salt("bit_depth")
+                        .selected_text(if s.depth == BitDepth::Bits24 { "24-bit" } else { "16-bit" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut s.depth, BitDepth::Bits16, "16-bit");
+                            ui.selectable_value(&mut s.depth, BitDepth::Bits24, "24-bit");
+                        });
                 }
-                None => ui.colored_label(WARNING, "Choose a folder to export to"),
-            };
-        });
-        ui.horizontal(|ui| {
-            ui.label("Prefix");
-            ui.add(egui::TextEdit::singleline(&mut s.names.prefix).desired_width(150.0))
-                .on_hover_text("Added to the start of every filename");
-            ui.label("Suffix");
-            ui.add(egui::TextEdit::singleline(&mut s.names.suffix).desired_width(150.0))
-                .on_hover_text("Added to the end of every filename, before the extension");
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut s.numbering_enabled, "Numbering")
-                .on_hover_text("Number the files in timeline order");
+            });
+            ui.add_space(4.0);
+            ui.checkbox(&mut s.numbering_enabled, "Number files");
             ui.add_enabled_ui(s.numbering_enabled, |ui| {
-                egui::ComboBox::from_id_salt("number_position")
-                    .selected_text(match s.number_position {
-                        NumberPosition::BeforeName => "Before name",
-                        NumberPosition::AfterName => "After name",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut s.number_position, NumberPosition::BeforeName, "Before name");
-                        ui.selectable_value(&mut s.number_position, NumberPosition::AfterName, "After name");
-                    })
-                    .response
-                    .on_hover_text("Where the number goes in the filename");
-                ui.label("Start");
-                ui.add(egui::DragValue::new(&mut s.number_start))
-                    .on_hover_text("The first file's number");
-                ui.label("Digits");
-                ui.add(egui::DragValue::new(&mut s.number_padding).range(1..=6))
-                    .on_hover_text("Minimum digits. 3 gives 001, 002, 003.");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("number_position")
+                        .selected_text(if s.number_position == NumberPosition::BeforeName { "Before name" } else { "After name" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut s.number_position, NumberPosition::BeforeName, "Before name");
+                            ui.selectable_value(&mut s.number_position, NumberPosition::AfterName, "After name");
+                        });
+                    ui.label("Start");
+                    ui.add(egui::DragValue::new(&mut s.number_start));
+                    ui.label("Digits");
+                    ui.add(egui::DragValue::new(&mut s.number_padding).range(1..=6));
+                });
             });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Format");
-            egui::ComboBox::from_id_salt("file_format")
-                .selected_text(s.format.label())
-                .width(70.0)
-                .show_ui(ui, |ui| {
-                    for format in [FileFormat::Wav, FileFormat::Mp3, FileFormat::Ogg] {
-                        ui.selectable_value(&mut s.format, format, format.label());
-                    }
-                })
-                .response
-                .on_hover_text("WAV is uncompressed. MP3 (192 kbps) and OGG (quality 6) make smaller files.");
-            ui.label("Sample rate");
-            egui::ComboBox::from_id_salt("sample_rate")
-                .selected_text(format!("{} Hz", s.sample_rate))
-                .show_ui(ui, |ui| {
-                    for rate in SAMPLE_RATES {
-                        ui.selectable_value(&mut s.sample_rate, rate, format!("{rate} Hz"));
-                    }
-                })
-                .response
-                .on_hover_text("48000 or 44100 Hz suit most uses. Lower rates make smaller files with less detail.");
-            // Only WAV has a bit depth.
-            ui.add_enabled_ui(s.format == FileFormat::Wav, |ui| {
-                ui.label("Bit depth");
-                egui::ComboBox::from_id_salt("bit_depth")
-                    .selected_text(match s.depth {
-                        BitDepth::Bits16 => "16-bit",
-                        BitDepth::Bits24 => "24-bit",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut s.depth, BitDepth::Bits16, "16-bit");
-                        ui.selectable_value(&mut s.depth, BitDepth::Bits24, "24-bit");
-                    })
-                    .response
-                    .on_hover_text("WAV precision. 16-bit suits most uses.")
-                    .on_disabled_hover_text("Only WAV has a bit depth");
-            });
-        });
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut s.only_selected, false, "All clips")
-                .on_hover_text("Export every clip on the track");
-            ui.add_enabled_ui(any_selected, |ui| {
-                ui.radio_value(&mut s.only_selected, true, "Selected clips")
-                    .on_hover_text("Export only the clips you selected")
-                    .on_disabled_hover_text("No clips are selected");
-            });
-            ui.checkbox(&mut s.overwrite, "Overwrite existing files")
-                .on_hover_text("Replace files that already have these names");
         });
     }
 
@@ -425,21 +506,18 @@ impl ExportDialog {
         selected: &[ClipId],
         plan: &[PlannedFile],
     ) {
-        if let Some(report) = &self.report {
-            report_ui(ui, report);
-        }
         ui.horizontal(|ui| {
             let can_start = self.can_start(plan);
             let export = ui
-                .add_enabled(can_start, egui::Button::new("Export files"))
+                .add_enabled(can_start, egui::Button::new(RichText::new("Export files").strong()).min_size(egui::vec2(120.0, 32.0)).fill(ui.visuals().selection.bg_fill))
                 .on_hover_text("Write the files listed above")
                 .on_disabled_hover_text("Choose a folder and fix any problems shown in red first");
             if export.clicked() {
-                self.start(ctx, project, selected, plan);
+                self.request_export(ctx, project, selected, plan);
             }
             let running = self.job.is_some();
             let close = ui
-                .add_enabled(!running, egui::Button::new("Close"))
+                .add_enabled(!running, egui::Button::new("Close").min_size(egui::vec2(76.0, 32.0)))
                 .on_hover_text("Close this window. Your settings are kept. (Esc)")
                 .on_disabled_hover_text("Wait for the export to finish");
             if close.clicked() {
@@ -455,12 +533,13 @@ impl ExportDialog {
     }
 }
 
-fn preview_ui(ui: &mut egui::Ui, plan: &[PlannedFile], overwrite: bool) {
+fn preview_ui(ui: &mut egui::Ui, plan: &[PlannedFile]) {
     let noun = if plan.len() == 1 { "file" } else { "files" };
-    ui.label(format!("{} {noun}", plan.len()));
+    ui.label(RichText::new(format!("Preview · {} {noun}", plan.len())).strong());
     egui::ScrollArea::vertical()
-        .max_height(130.0)
-        .auto_shrink([false, true])
+        .max_height(PREVIEW_HEIGHT)
+        .min_scrolled_height(PREVIEW_HEIGHT)
+        .auto_shrink([false, false])
         .show(ui, |ui| {
             for file in plan {
                 ui.horizontal(|ui| {
@@ -475,11 +554,8 @@ fn preview_ui(ui: &mut egui::Ui, plan: &[PlannedFile], overwrite: bool) {
                         Some(FileProblem::Duplicate) => {
                             ui.colored_label(PROBLEM, "same name as another clip");
                         }
-                        Some(FileProblem::Exists) if overwrite => {
-                            ui.colored_label(WARNING, "will overwrite");
-                        }
                         Some(FileProblem::Exists) => {
-                            ui.colored_label(PROBLEM, "already exists");
+                            ui.colored_label(WARNING, "already exists");
                         }
                         None => {}
                     }

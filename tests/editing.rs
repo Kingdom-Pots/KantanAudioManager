@@ -117,7 +117,7 @@ fn move_into_free_space_keeps_order() {
     let mut p = Project::new(RATE);
     add_ramp(&mut p, "a", 0, 10);
     let b = add_ramp(&mut p, "b", 0, 10);
-    p.move_clip(b, 500).unwrap();
+    p.move_clip(b, 500, 0).unwrap();
     assert_eq!(starts(&p), [0, 500]);
     assert_eq!(names(&p), ["a", "b"]);
 }
@@ -130,7 +130,7 @@ fn dragging_past_another_clip_reorders_them() {
     add_ramp(&mut p, "c", 0, 10); // 120..130
 
     // a's midpoint lands past b's midpoint but before c's.
-    p.move_clip(a, 62).unwrap();
+    p.move_clip(a, 62, 0).unwrap();
 
     assert_eq!(names(&p), ["b", "a", "c"]);
     assert_eq!(starts(&p), [60, 70, 120]);
@@ -146,7 +146,7 @@ fn dropping_onto_a_clip_pushes_later_clips_only_as_needed() {
 
     // d's midpoint (50) is past a's but before b's, so it lands between them,
     // stays clear of a, and pushes b. c starts exactly where b now ends.
-    p.move_clip(d, 0).unwrap();
+    p.move_clip(d, 0, 0).unwrap();
 
     assert_eq!(names(&p), ["a", "d", "b", "c"]);
     assert_eq!(starts(&p), [0, 10, 110, 120]);
@@ -157,7 +157,7 @@ fn moving_to_the_same_place_changes_nothing() {
     let mut p = Project::new(RATE);
     let a = add_ramp(&mut p, "a", 0, 10);
     add_ramp(&mut p, "b", 0, 10);
-    assert_eq!(p.move_clip(a, 0), Err(EditError::NoChange));
+    assert_eq!(p.move_clip(a, 0, 0), Err(EditError::NoChange));
 }
 
 #[test]
@@ -361,4 +361,36 @@ fn numbering_avoids_names_already_used() {
     let a = add_pattern(&mut p, "Take", &[(0.5, 10), (0.0, 10), (0.5, 10), (0.0, 10), (0.5, 10)]);
     p.split_on_silence(a, PAUSES).unwrap();
     assert_eq!(names(&p), ["Take 2", "Take", "Take 3", "Take 4"]);
+}
+
+#[test]
+fn dragged_edges_snap_to_nearby_edges() {
+    let mut p = Project::new(RATE);
+    add_ramp(&mut p, "a", 0, 10); // 0..10
+    let b = add_ramp(&mut p, "b", 0, 10); // 60..70
+    add_ramp(&mut p, "c", 0, 10); // 120..130
+
+    assert_eq!(p.landing(b, 13, 5), Ok(10), "left edge to a's end");
+    assert_eq!(p.landing(b, 108, 5), Ok(110), "right edge to c's start");
+    assert_eq!(p.landing(b, 40, 5), Ok(40), "nothing nearby");
+    assert_eq!(p.landing(b, 3, 5), Ok(10), "landing on a goes to its nearer free side");
+}
+
+#[test]
+fn dropping_on_a_clip_lands_flush_and_only_shifts_clips_without_room() {
+    let mut p = Project::new(RATE);
+    add_ramp(&mut p, "a", 0, 10); // 0..10
+    add_ramp(&mut p, "b", 0, 10); // 60..70
+    let c = add_ramp(&mut p, "c", 0, 20); // 120..140
+
+    // Fits in the gap, so nothing else moves.
+    p.move_clip(c, 45, 0).unwrap();
+    assert_eq!(names(&p), ["a", "c", "b"]);
+    assert_eq!(starts(&p), [0, 40, 60]);
+
+    // No gap left before b, so b shifts by exactly what's needed.
+    let d = add_ramp(&mut p, "d", 0, 30); // 120..150
+    p.move_clip(d, 40, 0).unwrap();
+    assert_eq!(names(&p), ["a", "c", "d", "b"]);
+    assert_eq!(starts(&p), [0, 40, 60, 90]);
 }

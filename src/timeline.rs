@@ -18,6 +18,8 @@ const LANE_MARGIN: f32 = 8.0;
 /// Closest zoom: each frame is 16 points wide.
 const MIN_FRAMES_PER_POINT: f64 = 1.0 / 16.0;
 const MIN_TICK_SPACING: f64 = 90.0;
+/// How close, on screen, a dragged edge must be to snap.
+const SNAP_POINTS: f64 = 8.0;
 const GHOST_OPACITY: f32 = 0.65;
 const DRAGGED_ORIGINAL_OPACITY: f32 = 0.35;
 
@@ -25,6 +27,10 @@ const BACKGROUND: Color32 = Color32::from_rgb(24, 26, 30);
 const RULER: Color32 = Color32::from_rgb(34, 37, 43);
 const TICK: Color32 = Color32::from_rgb(70, 75, 85);
 const LABEL: Color32 = Color32::from_rgb(170, 176, 186);
+const CLIP_BODY_SELECTED: Color32 = Color32::from_rgb(46, 66, 98);
+const LIVE_BODY: Color32 = Color32::from_rgb(64, 32, 36);
+const LIVE_HEADER: Color32 = Color32::from_rgb(170, 50, 45);
+const LIVE_WAVE: Color32 = Color32::from_rgb(245, 130, 120);
 const CLIP_BODY: Color32 = Color32::from_rgb(38, 46, 58);
 const CLIP_HEADER: Color32 = Color32::from_rgb(58, 70, 88);
 const CLIP_HEADER_SELECTED: Color32 = Color32::from_rgb(52, 120, 200);
@@ -125,6 +131,18 @@ impl Selection {
         }
     }
 
+    /// Handles clicking a clip's body. It selects the clip and places the cursor
+    /// at the click, so splitting and playing start from there. Shift extends a
+    /// range from the cursor instead, and ctrl toggles the clip.
+    pub fn click_body(&mut self, project: &Project, clip: &Clip, frame: Frames, modifiers: Modifiers) {
+        if modifiers.shift {
+            self.click_position(frame, true);
+        } else {
+            self.click_clip(project, clip, modifiers);
+            self.cursor = frame;
+        }
+    }
+
     /// Handles clicking somewhere other than a clip's header. Shift extends a
     /// range from the cursor, and a plain click moves the cursor.
     pub fn click_position(&mut self, frame: Frames, shift: bool) {
@@ -192,10 +210,21 @@ fn tick_step(frames_per_point: f64, sample_rate: u32) -> f64 {
     seconds * sample_rate as f64
 }
 
+/// The take being recorded, drawn where it will land.
+pub struct LivePreview<'a> {
+    pub name: &'a str,
+    pub start: Frames,
+    pub len: Frames,
+    /// One (min, max) per `frames_per_level` timeline frames.
+    pub levels: &'a [(f32, f32)],
+    pub frames_per_level: f64,
+}
+
 /// Something the user asked for on the track, for the app to carry out.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TimelineAction {
-    Move(ClipId, Frames),
+    /// A clip, the requested start, and the snapping distance in frames.
+    Move(ClipId, Frames, Frames),
     Rename(ClipId),
     Split(Frames),
     Merge,
@@ -322,6 +351,7 @@ impl Timeline {
         project: &Project,
         selection: &mut Selection,
         playhead: Option<Frames>,
+        live: Option<LivePreview<'_>>,
     ) -> Option<TimelineAction> {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let areas = Areas::new(rect);
@@ -329,6 +359,9 @@ impl Timeline {
 
         self.width = areas.lane.width() as f64;
         self.extent = extent(project);
+        if let Some(live) = &live {
+            self.extent = self.extent.max((live.start + live.len) as f64 * 1.02);
+        }
         if std::mem::take(&mut self.fit_requested) {
             self.view.fit(self.width, self.extent);
         }
@@ -336,12 +369,16 @@ impl Timeline {
         self.view.clamp(self.width, self.extent);
         self.handle_pointer(ui, &response, &areas, project, selection);
         self.context_menu(&response, project, selection);
+        self.update_pointer_icon(ui, &response, &areas, project);
         let hint = self.hover_hint(&response, &areas, project);
         if let Some(hint) = hint {
             response.clone().on_hover_text_at_pointer(hint);
         }
         if let Some(playhead) = playhead {
             self.follow(playhead as f64);
+        }
+        if let Some(live) = &live {
+            self.follow_recording((live.start + live.len) as f64);
         }
         self.view.clamp(self.width, self.extent);
 
@@ -359,6 +396,9 @@ impl Timeline {
             }
             self.paint_clip(&clip_painter, &areas, project, clip, selection.clips.contains(&clip.id));
         }
+        if let Some(live) = &live {
+            self.paint_live(&painter, &areas, live);
+        }
         self.paint_selection(&painter, &areas, selection);
         self.paint_ruler(&painter, &areas, project.sample_rate());
         if let Some(playhead) = playhead {
@@ -373,6 +413,26 @@ impl Timeline {
         self.action.take()
     }
 
+    /// Shows what a drag would do: move a clip, or select a range.
+    fn update_pointer_icon(&self, ui: &Ui, response: &Response, areas: &Areas, project: &Project) {
+        let icon = if matches!(self.drag, Drag::Clip { .. }) {
+            Some(egui::CursorIcon::Grabbing)
+        } else {
+            response.hover_pos().and_then(|pos| {
+                if self.clip_header_at(areas, project, pos).is_some() {
+                    Some(egui::CursorIcon::Grab)
+                } else if areas.lane.contains(pos) {
+                    Some(egui::CursorIcon::Text)
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(icon) = icon {
+            ui.ctx().set_cursor_icon(icon);
+        }
+    }
+
     /// Explains what the part of the track under the pointer does.
     fn hover_hint(&self, response: &Response, areas: &Areas, project: &Project) -> Option<&'static str> {
         if !matches!(self.drag, Drag::None) {
@@ -384,9 +444,11 @@ impl Timeline {
         } else if areas.ruler.contains(pos) {
             Some("Click to move the cursor here. Ctrl+Scroll zooms.")
         } else if self.clip_header_at(areas, project, pos).is_some() {
-            Some("Click to select, Ctrl or Shift+click for more. Drag to move. Double-click to rename. Right-click for more.")
+            Some("Drag to move the clip. Click to select it, with Ctrl or Shift to add more. Double-click to rename. Right-click for more.")
+        } else if self.clip_at(areas, project, pos).is_some() {
+            Some("Click to select the clip and place the cursor. Drag to select a range. Right-click for more.")
         } else {
-            Some("Click to place the cursor. Drag to select a range. Right-click for more.")
+            Some("Click to place the cursor. Drag to select a range.")
         }
     }
 
@@ -426,7 +488,25 @@ impl Timeline {
     fn paint_clip_drag(&self, painter: &Painter, areas: &Areas, project: &Project) {
         let Drag::Clip { id, start, .. } = self.drag else { return };
         let Some(clip) = project.clip(id) else { return };
+        // The ghost shows where the clip will really land.
+        let start = project.landing(id, start, self.snap_frames()).unwrap_or(start);
         let moved = Clip { start, ..clip.clone() };
+
+        // A guide marks an edge that lines up with another clip.
+        for frame in [start, moved.end()] {
+            let aligned = project
+                .clips()
+                .iter()
+                .filter(|c| c.id != id)
+                .any(|c| c.start == frame || c.end() == frame);
+            if aligned {
+                let x = areas.lane.left() + self.view.offset_of(frame as f64) as f32;
+                painter.line_segment(
+                    [pos2(x, areas.lane.top()), pos2(x, areas.lane.bottom())],
+                    Stroke::new(1.0, PLAYHEAD),
+                );
+            }
+        }
         let mut ghost = painter.with_clip_rect(areas.lane);
         ghost.set_opacity(GHOST_OPACITY);
         self.paint_clip(&ghost, areas, project, &moved, true);
@@ -436,6 +516,71 @@ impl Timeline {
             Stroke::new(1.5, CURSOR),
             StrokeKind::Inside,
         );
+    }
+
+    /// Keeps the growing end of a recording on screen, sliding smoothly.
+    fn follow_recording(&mut self, end: f64) {
+        let visible = self.width * self.view.frames_per_point;
+        if end > self.view.scroll + visible * 0.95 {
+            self.view.scroll = end - visible * 0.95;
+        } else if end < self.view.scroll {
+            self.view.scroll = (end - visible * 0.5).max(0.0);
+        }
+    }
+
+    fn paint_live(&self, painter: &Painter, areas: &Areas, live: &LivePreview<'_>) {
+        let clip_area = |start: f64, end: f64| {
+            let left = areas.lane.left() + self.view.offset_of(start) as f32;
+            let right = areas.lane.left() + self.view.offset_of(end) as f32;
+            Rect::from_min_max(
+                pos2(left, areas.lane.top() + LANE_MARGIN),
+                pos2(right.max(left + 1.0), areas.lane.bottom() - LANE_MARGIN),
+            )
+        };
+        let rect = clip_area(live.start as f64, (live.start + live.len) as f64);
+        let painter = painter.with_clip_rect(areas.lane);
+        let radius = CornerRadius::same(3);
+        painter.rect_filled(rect, radius, LIVE_BODY);
+        let header = Rect::from_min_size(rect.min, vec2(rect.width(), CLIP_HEADER_HEIGHT));
+        painter.rect_filled(header, radius, LIVE_HEADER);
+        painter.with_clip_rect(header.intersect(areas.lane)).text(
+            pos2(rect.left().max(areas.lane.left()) + 6.0, header.center().y),
+            Align2::LEFT_CENTER,
+            live.name,
+            FontId::proportional(13.0),
+            Color32::WHITE,
+        );
+
+        let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), rect.max);
+        let center = body.center().y;
+        let half_height = body.height() / 2.0 - 3.0;
+        let first = body.left().max(areas.lane.left()).floor() as i32;
+        let last = body.right().min(areas.lane.right()).ceil() as i32;
+        for x in first..last {
+            let offset = (x as f32 - areas.lane.left()) as f64;
+            let from = (self.view.frame_at(offset) - live.start as f64).max(0.0) / live.frames_per_level;
+            let to = (self.view.frame_at(offset + 1.0) - live.start as f64) / live.frames_per_level;
+            let (from, to) = (from as usize, (to.ceil() as usize).max(from as usize + 1));
+            let Some(levels) = live.levels.get(from..to.min(live.levels.len())) else { continue };
+            if levels.is_empty() {
+                continue;
+            }
+            let (lo, hi) = levels.iter().fold((f32::MAX, f32::MIN), |(a, b), &(l, h)| (a.min(l), b.max(h)));
+            let top = center - hi.clamp(-1.0, 1.0) * half_height;
+            let bottom = center - lo.clamp(-1.0, 1.0) * half_height;
+            let (top, bottom) = if bottom - top < 2.0 {
+                let middle = ((top + bottom) / 2.0).round();
+                (middle - 1.0, middle + 1.0)
+            } else {
+                (top, bottom)
+            };
+            painter.rect_filled(
+                Rect::from_min_max(pos2(x as f32, top), pos2(x as f32 + 1.0, bottom)),
+                CornerRadius::ZERO,
+                LIVE_WAVE,
+            );
+        }
+        painter.rect_stroke(rect, radius, Stroke::new(1.5, LIVE_WAVE), StrokeKind::Inside);
     }
 
     /// Turns the page when the playhead leaves the view.
@@ -490,19 +635,13 @@ impl Timeline {
             match self.drag {
                 Drag::None => {}
                 Drag::Range { start } => {
-                    // Scroll when dragging past either edge of the lane.
-                    let past_left = (areas.lane.left() - pointer.x).max(0.0);
-                    let past_right = (pointer.x - areas.lane.right()).max(0.0);
-                    if past_left > 0.0 || past_right > 0.0 {
-                        self.view.scroll +=
-                            (past_right - past_left) as f64 * self.view.frames_per_point * 0.2;
-                        ui.ctx().request_repaint();
-                    }
+                    self.scroll_past_edges(ui, areas, pointer.x);
                     let x = pointer.x.clamp(areas.lane.left(), areas.lane.right());
                     selection.set_range(start, frame_at(&self.view, x));
                 }
                 Drag::Scrollbar { grab } => self.drag_scrollbar(areas, pointer.x, grab),
                 Drag::Clip { id, grab, .. } => {
+                    self.scroll_past_edges(ui, areas, pointer.x);
                     let start = frame_at(&self.view, pointer.x).saturating_sub(grab);
                     self.drag = Drag::Clip { id, grab, start };
                 }
@@ -511,7 +650,14 @@ impl Timeline {
 
         if response.drag_stopped() {
             if let Drag::Clip { id, start, .. } = self.drag {
-                self.action = Some(TimelineAction::Move(id, start));
+                self.action = Some(TimelineAction::Move(id, start, self.snap_frames()));
+                if !selection.clips.contains(&id)
+                    && let Some(clip) = project.clip(id)
+                {
+                    let cursor = selection.cursor;
+                    selection.click_clip(project, clip, Modifiers::NONE);
+                    selection.cursor = cursor;
+                }
             }
             self.drag = Drag::None;
         }
@@ -521,10 +667,12 @@ impl Timeline {
         {
             self.menu_frame = frame_at(&self.view, pointer.x);
             // The menu acts on the selection, so a clip outside it joins by replacing it.
-            if let Some(clip) = self.clip_header_at(areas, project, pointer)
+            let in_range = selection.range.is_some_and(|r| self.menu_frame >= r.start && self.menu_frame < r.end);
+            if let Some(clip) = self.clip_at(areas, project, pointer)
                 && !selection.clips.contains(&clip.id)
+                && !in_range
             {
-                selection.click_clip(project, clip, Modifiers::NONE);
+                selection.click_body(project, clip, self.menu_frame, Modifiers::NONE);
             }
         }
 
@@ -542,10 +690,33 @@ impl Timeline {
                 self.drag_scrollbar(areas, pointer.x, thumb.width() as f64 / 2.0);
             } else if let Some(clip) = self.clip_header_at(areas, project, pointer) {
                 selection.click_clip(project, clip, modifiers);
+            } else if let Some(clip) = self.clip_at(areas, project, pointer) {
+                selection.click_body(project, clip, frame_at(&self.view, pointer.x), modifiers);
             } else {
                 selection.click_position(frame_at(&self.view, pointer.x), modifiers.shift);
             }
         }
+    }
+
+    fn snap_frames(&self) -> Frames {
+        (SNAP_POINTS * self.view.frames_per_point) as Frames
+    }
+
+    /// Scrolls while a drag is held past either edge of the lane.
+    fn scroll_past_edges(&mut self, ui: &Ui, areas: &Areas, x: f32) {
+        let past_left = (areas.lane.left() - x).max(0.0);
+        let past_right = (x - areas.lane.right()).max(0.0);
+        if past_left > 0.0 || past_right > 0.0 {
+            self.view.scroll += (past_right - past_left) as f64 * self.view.frames_per_point * 0.2;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn clip_at<'a>(&self, areas: &Areas, project: &'a Project, pos: Pos2) -> Option<&'a Clip> {
+        if !areas.lane.contains(pos) {
+            return None;
+        }
+        project.clips().iter().find(|clip| areas.clip_rect(&self.view, clip).contains(pos))
     }
 
     fn clip_header_at<'a>(&self, areas: &Areas, project: &'a Project, pos: Pos2) -> Option<&'a Clip> {
@@ -601,7 +772,7 @@ impl Timeline {
         }
 
         let radius = CornerRadius::same(3);
-        painter.rect_filled(rect, radius, CLIP_BODY);
+        painter.rect_filled(rect, radius, if selected { CLIP_BODY_SELECTED } else { CLIP_BODY });
 
         let header = Rect::from_min_size(rect.min, vec2(rect.width(), CLIP_HEADER_HEIGHT));
         let header_color = if selected { CLIP_HEADER_SELECTED } else { CLIP_HEADER };

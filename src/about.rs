@@ -12,12 +12,13 @@ const DEVELOPED_WITH: &str = "Claude Opus 5.5";
 pub const NOTICES: &str = include_str!("../THIRD_PARTY_NOTICES.txt");
 
 /// Name, licence and what it does here.
-const COMPONENTS: [(&str, &str, &str); 10] = [
+const COMPONENTS: [(&str, &str, &str); 11] = [
     ("egui / eframe", "MIT or Apache-2.0", "interface and window"),
     ("cpal", "Apache-2.0", "microphone, system audio and playback"),
     ("Symphonia", "MPL-2.0", "reading audio files"),
     ("Rubato", "MIT or Apache-2.0", "sample rate conversion"),
     ("audioadapter-buffers", "MIT or Apache-2.0", "passing audio to the sample rate converter"),
+    ("tempfile", "MIT or Apache-2.0", "safe export file creation"),
     ("Hound", "Apache-2.0", "writing WAV files"),
     ("LAME via mp3lame-encoder", "LGPL-3.0", "writing MP3 files"),
     ("vorbis_rs, aoTuV/Lancer Vorbis, Ogg", "BSD-3-Clause", "writing OGG files"),

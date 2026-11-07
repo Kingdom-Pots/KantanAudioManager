@@ -35,7 +35,7 @@ Commands, one per line. # starts a comment, and \"quotes\" allow spaces.
   click X Y [MODS]           Click at a position, in points
   drag X1 Y1 X2 Y2 [MODS]    Drag between positions, in points
   export KEY VALUE           Set an option in the open export window:
-                             folder, prefix, suffix, rate, overwrite on|off,
+                             folder, prefix, suffix, rate,
                              format wav|mp3|ogg, bits 16|24, scope all|selected,
                              numbering off|before|after, start, digits
   export-wait                Wait for a running export to finish
@@ -638,8 +638,6 @@ impl Bridge {
             ("bits", "24") => s.depth = BitDepth::Bits24,
             ("scope", "all") => s.only_selected = false,
             ("scope", "selected") => s.only_selected = true,
-            ("overwrite", "on") => s.overwrite = true,
-            ("overwrite", "off") => s.overwrite = false,
             ("numbering", "off") => s.numbering_enabled = false,
             ("numbering", "before") => {
                 s.numbering_enabled = true;
@@ -721,6 +719,8 @@ impl Bridge {
             "recording": {
                 "active": app.recorder().is_recording(),
                 "finishing": app.recorder().is_finishing(),
+                "seconds": app.recorder().seconds(),
+                "live_levels": app.recorder().with_live_levels(|levels| levels.len()),
             },
             "dialog": { "open": dialog_name, "db": amplify_db, "peak": amplify_peak },
             "playback": {
@@ -731,6 +731,7 @@ impl Bridge {
             "export": {
                 "open": dialog.open,
                 "running": dialog.is_running(),
+                "conflict": dialog.awaiting_conflict(),
                 "files": files,
                 "report": report,
             },

@@ -1,5 +1,6 @@
 //! Turns clips into WAV files: working out filenames, then writing them.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::import::resample;
@@ -155,24 +156,45 @@ pub struct ExportReport {
     pub clipped: Vec<String>,
 }
 
+/// How a batch handles names that already exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingFiles {
+    Refuse,
+    Replace,
+    KeepBoth,
+}
+
 /// Writes one WAV per clip. `progress` is called after each file with the number done.
 pub fn export_clips(
     project: &Project,
     files: &[(ClipId, PathBuf)],
     sample_rate: u32,
     format: OutputFormat,
+    progress: impl FnMut(usize),
+) -> ExportReport {
+    export_clips_with_policy(project, files, sample_rate, format, ExistingFiles::Replace, progress)
+}
+
+/// Publishes complete files using the conflict choice made for this batch.
+pub fn export_clips_with_policy(
+    project: &Project,
+    files: &[(ClipId, PathBuf)],
+    sample_rate: u32,
+    format: OutputFormat,
+    policy: ExistingFiles,
     mut progress: impl FnMut(usize),
 ) -> ExportReport {
+    let reserved: HashSet<String> = files.iter().map(|(_, path)| path.to_string_lossy().to_lowercase()).collect();
     let mut report = ExportReport::default();
     for (index, (id, path)) in files.iter().enumerate() {
         let shown = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        match write_clip(project, *id, path, sample_rate, format) {
-            Ok(clipped) => {
+        match write_clip(project, *id, path, sample_rate, format, policy, &reserved) {
+            Ok((clipped, written_path)) => {
                 report.written += 1;
                 if clipped {
-                    report.clipped.push(shown);
+                    report.clipped.push(written_path.file_name().unwrap_or_default().to_string_lossy().into_owned());
                 }
             }
             Err(error) => report.failed.push(format!("{shown}: {error}")),
@@ -189,7 +211,9 @@ fn write_clip(
     path: &Path,
     sample_rate: u32,
     format: OutputFormat,
-) -> Result<bool, String> {
+    policy: ExistingFiles,
+    reserved: &HashSet<String>,
+) -> Result<(bool, PathBuf), String> {
     let clip = project.clip(id).ok_or("the clip no longer exists")?;
     let rendered = render_clip(project, clip);
     let samples = resample(
@@ -200,23 +224,53 @@ fn write_clip(
     )
     .map_err(|e| e.to_string())?;
 
-    // A partial file must never replace a good one, or look like a finished export.
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".part");
-    let temp = PathBuf::from(temp);
+    // Each job owns a unique temporary file. Publish only after encoding completes.
+    let temp = tempfile::Builder::new()
+        .prefix(".kantan-export-")
+        .suffix(".part")
+        .tempfile_in(path.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|error| error.to_string())?
+        .into_temp_path();
     let channels = rendered.channels;
-    let result = match format {
+    match format {
         OutputFormat::Wav(depth) => write_wav(&temp, &samples, channels, sample_rate, depth),
         OutputFormat::Mp3 => write_mp3(&temp, &samples, channels, sample_rate),
         OutputFormat::Ogg => write_ogg(&temp, &samples, channels, sample_rate),
-    }
-        .and_then(|()| std::fs::rename(&temp, path).map_err(|e| e.to_string()));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result?;
+    }?;
+    let published = publish_file(temp, path, policy, reserved)?;
+    Ok((samples.iter().any(|s| s.abs() > 1.0), published))
+}
 
-    Ok(samples.iter().any(|s| s.abs() > 1.0))
+fn publish_file(
+    mut temp: tempfile::TempPath,
+    path: &Path,
+    policy: ExistingFiles,
+    reserved: &HashSet<String>,
+) -> Result<PathBuf, String> {
+    if policy == ExistingFiles::Replace {
+        temp.persist(path).map_err(|error| error.to_string())?;
+        return Ok(path.to_path_buf());
+    }
+    let mut destination = path.to_path_buf();
+    let mut copy_number = 2u64;
+    loop {
+        match temp.persist_noclobber(&destination) {
+            Ok(()) => return Ok(destination),
+            Err(error) if policy == ExistingFiles::KeepBoth && error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                temp = error.path;
+                loop {
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                    let extension = path.extension().unwrap_or_default().to_string_lossy();
+                    destination = path.with_file_name(format!("{stem} ({copy_number}).{extension}"));
+                    copy_number += 1;
+                    if !destination.exists() && !reserved.contains(&destination.to_string_lossy().to_lowercase()) {
+                        break;
+                    }
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
 fn write_wav(
@@ -539,4 +593,35 @@ mod tests {
         assert!(report.failed[0].starts_with("bad.wav"));
         assert!(good.exists());
     }
+    #[test]
+    fn unconfirmed_export_preserves_a_file_that_appeared_after_preview() {
+        let dir = TempDir::new("refuse");
+        let path = dir.0.join("a.wav");
+        std::fs::write(&path, b"original").unwrap();
+        let (project, id) = project_with_clip(1, vec![0.5]);
+        let report = export_clips_with_policy(&project, &[(id, path.clone())],
+            48000, OutputFormat::Wav(BitDepth::Bits16), ExistingFiles::Refuse, |_| {});
+        assert_eq!(report.written, 0);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn copies_reserve_names_for_the_remaining_batch() {
+        let dir = TempDir::new("reserved_copy");
+        let path = dir.0.join("a.wav");
+        let next = dir.0.join("a (2).wav");
+        std::fs::write(&path, b"original").unwrap();
+        let (project, id) = project_with_clip(1, vec![0.5]);
+        let report = export_clips_with_policy(&project, &[(id, path.clone()), (id, next.clone())],
+            48000, OutputFormat::Wav(BitDepth::Bits16), ExistingFiles::KeepBoth, |_| {});
+        assert_eq!(report.written, 2);
+        assert!(report.failed.is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+        assert!(next.exists());
+        assert!(dir.0.join("a (3).wav").exists());
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 3);
+    }
+
 }

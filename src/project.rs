@@ -333,6 +333,11 @@ impl Project {
         id
     }
 
+    /// Where a new take or import goes: after the last clip, with a gap.
+    pub fn next_take_start(&self) -> Frames {
+        self.clips.last().map_or(0, |c| c.end() + self.take_gap())
+    }
+
     /// The first `Recording N` name that no clip uses.
     pub fn next_recording_name(&self) -> String {
         (1..)
@@ -348,7 +353,7 @@ impl Project {
             .source(source)
             .ok_or(EditError::InvalidSource("unknown source"))?
             .frames();
-        let start = self.clips.last().map_or(0, |c| c.end() + self.take_gap());
+        let start = self.next_take_start();
         let id = self.new_clip_id();
         self.clips.push(Clip {
             id,
@@ -490,28 +495,48 @@ impl Project {
         Ok(target.id)
     }
 
-    /// Moves a clip towards `requested_start`.
-    ///
-    /// Its midpoint decides where it lands in the order, so dragging past
-    /// another clip reorders them. It is then kept clear of the clip before it,
-    /// and pushes later clips right only as far as needed to avoid overlap.
-    pub fn move_clip(&mut self, id: ClipId, requested_start: Frames) -> Result<(), EditError> {
+    /// Where a clip would land if dragged to `requested`. An edge within `snap`
+    /// frames of another clip's edge, or the start of the track, lines up with it.
+    /// Landing on another clip puts it flush against that clip's nearer side.
+    pub fn landing(&self, id: ClipId, requested: Frames, snap: Frames) -> Result<Frames, EditError> {
+        let len = self.clips[self.index_of(id)?].len();
+        let others = || self.clips.iter().filter(|c| c.id != id);
+
+        let mut best: Option<(Frames, Frames)> = (requested <= snap).then_some((requested, 0));
+        for edge in others().flat_map(|c| [c.start, c.end()]) {
+            for candidate in [Some(edge), edge.checked_sub(len)].into_iter().flatten() {
+                let distance = candidate.abs_diff(requested);
+                if distance <= snap && best.is_none_or(|(closest, _)| distance < closest) {
+                    best = Some((distance, candidate));
+                }
+            }
+        }
+        let start = best.map_or(requested, |(_, candidate)| candidate);
+
+        let overlap = |c: &Clip| (start + len).min(c.end()).saturating_sub(start.max(c.start));
+        let Some(hit) = others().filter(|c| overlap(c) > 0).max_by_key(|c| overlap(c)) else {
+            return Ok(start);
+        };
+        if start + len / 2 >= hit.start + hit.len() / 2 {
+            return Ok(hit.end());
+        }
+        // Before the clip it hit, but never over the one before that.
+        let earliest = others().filter(|c| c.start < hit.start).map(Clip::end).max().unwrap_or(0);
+        Ok(hit.start.saturating_sub(len).max(earliest))
+    }
+
+    /// Moves a clip to where `landing` says. Later clips only shift when there
+    /// is truly no room, and then only as far as needed.
+    pub fn move_clip(&mut self, id: ClipId, requested: Frames, snap: Frames) -> Result<(), EditError> {
+        let start = self.landing(id, requested, snap)?;
         let index = self.index_of(id)?;
         let before = self.clips.clone();
 
         let mut clip = self.clips.remove(index);
-        let midpoint = requested_start + clip.len() / 2;
-        let insert_at = self
-            .clips
-            .iter()
-            .position(|c| midpoint < c.start + c.len() / 2)
-            .unwrap_or(self.clips.len());
-
-        let earliest = insert_at.checked_sub(1).map_or(0, |i| self.clips[i].end());
-        clip.start = requested_start.max(earliest);
+        clip.start = start;
+        let insert_at = self.clips.partition_point(|c| c.start < start);
         let mut end = clip.end();
         self.clips.insert(insert_at, clip);
-
         for later in &mut self.clips[insert_at + 1..] {
             later.start = later.start.max(end);
             end = later.end();

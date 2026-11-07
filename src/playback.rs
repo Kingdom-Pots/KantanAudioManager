@@ -8,6 +8,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::{Frames, Project, SegmentKind};
 
+/// Whether a stream error really ends the stream. Windows reports a harmless
+/// underrun when capturing system audio, and a reroute keeps the stream going.
+pub(crate) fn is_fatal(error: &cpal::Error) -> bool {
+    !matches!(error.kind(), cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged)
+}
+
 /// One frame of the track as left and right, after gain. Gaps are silent.
 fn stereo_frame(project: &Project, frame: Frames) -> [f32; 2] {
     let clips = project.clips();
@@ -168,7 +174,11 @@ fn open_stream(mut reader: TrackReader, project_rate: u32) -> Result<cpal::Strea
 
     // If the device goes away, end playback instead of appearing stuck.
     let finished = reader.finished.clone();
-    let on_error = move |_| finished.store(true, Ordering::Relaxed);
+    let on_error = move |error: cpal::Error| {
+        if is_fatal(&error) {
+            finished.store(true, Ordering::Relaxed);
+        }
+    };
 
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => device.build_output_stream(
@@ -210,6 +220,13 @@ mod tests {
             shared_position: Arc::new(AtomicU64::new(from)),
             finished: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn only_real_failures_end_a_stream() {
+        assert!(!is_fatal(&cpal::Error::new(cpal::ErrorKind::Xrun)));
+        assert!(!is_fatal(&cpal::Error::new(cpal::ErrorKind::DeviceChanged)));
+        assert!(is_fatal(&cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable)));
     }
 
     #[test]

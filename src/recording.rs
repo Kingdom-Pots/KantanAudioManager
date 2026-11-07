@@ -3,7 +3,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -53,6 +54,11 @@ pub fn input_choices() -> Vec<InputChoice> {
         .collect()
 }
 
+/// The live preview keeps one level per 10 ms.
+fn live_frames_per_peak(rate: u32) -> usize {
+    (rate as usize / 100).max(1)
+}
+
 fn downmix(chunk: &[f32], channels: usize) -> impl Iterator<Item = f32> + '_ {
     chunk
         .chunks_exact(channels)
@@ -74,7 +80,10 @@ fn write_take(
     rate: u32,
     project_rate: u32,
     frames: Arc<AtomicU64>,
+    live: Arc<Mutex<Vec<(f32, f32)>>>,
 ) -> Result<Source, String> {
+    let per_peak = live_frames_per_peak(rate);
+    let mut peaked = 0;
     let path = temp_path();
     let spec = hound::WavSpec {
         channels: 1,
@@ -99,6 +108,15 @@ fn write_take(
             if unflushed >= rate as usize {
                 let _ = writer.flush();
                 unflushed = 0;
+            }
+        }
+        // Levels for the live preview, in whole steps so old ones never change.
+        if samples.len() >= peaked + per_peak {
+            let mut levels = live.lock().unwrap_or_else(|e| e.into_inner());
+            while samples.len() >= peaked + per_peak {
+                let step = &samples[peaked..peaked + per_peak];
+                levels.push(step.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &s| (lo.min(s), hi.max(s))));
+                peaked += per_peak;
             }
         }
         frames.store(samples.len() as u64, Ordering::Relaxed);
@@ -129,7 +147,8 @@ struct Active {
     rate: u32,
     frames: Arc<AtomicU64>,
     peak: Arc<AtomicU32>,
-    lost: Arc<AtomicBool>,
+    lost: Arc<Mutex<Option<String>>>,
+    live: Arc<Mutex<Vec<(f32, f32)>>>,
 }
 
 pub struct Recorder {
@@ -152,15 +171,23 @@ impl Recorder {
         self.finishing.is_some()
     }
 
-    /// Whether the microphone stopped working mid-take.
-    pub fn device_lost(&self) -> bool {
-        self.active.as_ref().is_some_and(|a| a.lost.load(Ordering::Relaxed))
+    /// Why the input stopped working mid-take, if it did.
+    pub fn device_lost(&self) -> Option<String> {
+        let active = self.active.as_ref()?;
+        active.lost.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn seconds(&self) -> f64 {
         self.active.as_ref().map_or(0.0, |a| {
             a.frames.load(Ordering::Relaxed) as f64 / a.rate as f64
         })
+    }
+
+    /// Passes the take's levels so far to `read`, one (min, max) per 10 ms.
+    pub fn with_live_levels<T>(&self, read: impl FnOnce(&[(f32, f32)]) -> T) -> Option<T> {
+        let active = self.active.as_ref()?;
+        let levels = active.live.lock().unwrap_or_else(|e| e.into_inner());
+        Some(read(&levels))
     }
 
     /// The peak input level since this was last called.
@@ -174,7 +201,7 @@ impl Recorder {
     pub fn start(&mut self, device: Option<&InputChoice>, project_rate: u32) -> Result<(), String> {
         let (sender, chunks) = mpsc::channel::<Vec<f32>>();
         let peak = Arc::new(AtomicU32::new(0));
-        let lost = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(Mutex::new(None));
         let frames = Arc::new(AtomicU64::new(0));
 
         let (stream, simulated, channels, rate) = if self.use_device {
@@ -186,11 +213,13 @@ impl Recorder {
 
         let (done, finishing) = mpsc::channel();
         let writer_frames = frames.clone();
+        let live = Arc::new(Mutex::new(Vec::new()));
+        let writer_live = live.clone();
         std::thread::spawn(move || {
-            let _ = done.send(write_take(chunks, channels, rate, project_rate, writer_frames));
+            let _ = done.send(write_take(chunks, channels, rate, project_rate, writer_frames, writer_live));
         });
         self.finishing = Some(finishing);
-        self.active = Some(Active { _stream: stream, simulated, channels, rate, frames, peak, lost });
+        self.active = Some(Active { _stream: stream, simulated, channels, rate, frames, peak, lost, live });
         Ok(())
     }
 
@@ -257,7 +286,7 @@ fn open_input(
     choice: Option<&InputChoice>,
     sender: Sender<Vec<f32>>,
     peak: Arc<AtomicU32>,
-    lost: Arc<AtomicBool>,
+    lost: Arc<Mutex<Option<String>>>,
 ) -> Result<(InputStreams, usize, u32), String> {
     let host = cpal::default_host();
     let named = |mut devices: Box<dyn Iterator<Item = cpal::Device>>, name: &str| {
@@ -296,7 +325,12 @@ fn open_input(
                 store_peak(&peak, loudest);
                 let _ = sender.send(data.to_vec());
             },
-            move |_| lost.store(true, Ordering::Relaxed),
+            move |error: cpal::Error| {
+                // Glitches and reroutes leave the stream running, so a take goes on.
+                if crate::playback::is_fatal(&error) {
+                    *lost.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+                }
+            },
             None,
         )
         .map_err(|e| e.to_string())?;
@@ -335,6 +369,27 @@ mod tests {
     }
 
     #[test]
+    fn live_levels_grow_during_the_take_and_show_its_shape() {
+        let mut recorder = Recorder::new(false);
+        recorder.start(None, 48000).unwrap();
+        recorder.feed(vec![0.5; SIMULATED_RATE as usize / 10]);
+        recorder.feed(vec![-0.25; SIMULATED_RATE as usize / 10]);
+        let expected = 20;
+        for _ in 0..2000 {
+            if recorder.with_live_levels(|l| l.len()) == Some(expected) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (first, last) = recorder.with_live_levels(|l| (l[0], l[l.len() - 1])).unwrap();
+        assert_eq!(first, (0.5, 0.5));
+        assert_eq!(last, (-0.25, -0.25));
+        recorder.stop();
+        assert_eq!(recorder.with_live_levels(|l| l.len()), None);
+        finished(&mut recorder).unwrap();
+    }
+
+    #[test]
     fn an_empty_take_is_an_error() {
         let mut recorder = Recorder::new(false);
         recorder.start(None, 48000).unwrap();
@@ -347,19 +402,22 @@ mod tests {
     #[test]
     #[ignore = "needs a sound device"]
     fn real_system_audio_delivers_data_during_silence() {
-        let choice = input_choices().into_iter().find(|c| c.system_audio).expect("an output device");
-        let (sender, chunks) = mpsc::channel();
-        let streams = open_input(
-            Some(&choice),
-            sender,
-            Arc::new(AtomicU32::new(0)),
-            Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        drop(streams);
-        let delivered: usize = chunks.iter().map(|c| c.len()).sum();
-        assert!(delivered > 0, "no data from {}", choice.label());
+        for choice in input_choices().into_iter().filter(|c| c.system_audio) {
+            let (sender, chunks) = mpsc::channel();
+            let lost = Arc::new(Mutex::new(None));
+            let peak = Arc::new(AtomicU32::new(0));
+            let opened = open_input(Some(&choice), sender, peak.clone(), lost.clone());
+            let Ok(streams) = opened.map_err(|e| println!("{}: can't open: {e}", choice.label())) else {
+                continue;
+            };
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            drop(streams);
+            let delivered: usize = chunks.iter().map(|c| c.len()).sum();
+            let level = f32::from_bits(peak.load(Ordering::Relaxed));
+            println!("{}: {delivered} samples, peak {level}, error {:?}", choice.label(), lost.lock().unwrap());
+            assert!(delivered > 0, "no data from {}", choice.label());
+            assert_eq!(*lost.lock().unwrap(), None, "{}", choice.label());
+        }
     }
 
     #[test]
@@ -374,7 +432,7 @@ mod tests {
         let frames = Arc::new(AtomicU64::new(0));
         let writer = {
             let frames = frames.clone();
-            std::thread::spawn(move || write_take(chunks, 1, 1000, 1000, frames))
+            std::thread::spawn(move || write_take(chunks, 1, 1000, 1000, frames, Arc::default()))
         };
         sender.send(vec![0.25; 2500]).unwrap();
         while frames.load(Ordering::Relaxed) < 2500 {

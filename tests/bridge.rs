@@ -290,15 +290,16 @@ fn problems_block_export_until_resolved() {
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("intro.wav"), b"keep me").unwrap();
     let states = run(&format!(
-        "{}\nkey ctrl+e\nbutton \"Export files\"\nexport-wait\nstate\nexport folder \"{}\"\nbutton \"Export files\"\nexport-wait\nstate\nexport overwrite on\nbutton \"Export files\"\nexport-wait\nstate\n",
+        "{}\nkey ctrl+e\nbutton \"Export files\"\nexport-wait\nstate\nexport folder \"{}\"\nbutton \"Export files\"\nexport-wait\nstate\nbutton \"Replace existing\"\nexport-wait\nstate\n",
         samples.import_line("import"),
         out.display(),
     ));
-    // No folder, then an existing file: nothing is written either time.
+    // No folder, then a conflict prompt: nothing is written before confirmation.
     assert_eq!(states[0]["export"]["report"], Value::Null);
     assert_eq!(states[1]["export"]["report"], Value::Null);
     assert_eq!(states[1]["export"]["files"][0]["problem"], "exists");
-    // Overwriting allowed.
+    assert_eq!(states[1]["export"]["conflict"], true);
+    // Replacement was explicitly confirmed.
     assert_eq!(states[2]["export"]["report"]["written"], 4);
     assert!(hound::WavReader::open(out.join("intro.wav")).is_ok());
 }
@@ -871,7 +872,7 @@ fn tooltips_follow_state() {
 fn export_window_controls_explain_themselves() {
     let samples = Samples::new("tipsexport");
     run(&format!(
-        "{}\nkey ctrl+e\nexpect-tip \"Folder...\" \"where the files go\"\nexpect-tip \"Export files\" \"Choose a folder\"\nexpect-tip Close \"settings are kept\"\n",
+        "{}\nkey ctrl+e\nexpect-tip \"Choose folder…\" \"where the files go\"\nexpect-tip \"Export files\" \"Choose a folder\"\nexpect-tip Close \"settings are kept\"\n",
         samples.import_line("import")
     ));
 }
@@ -886,4 +887,101 @@ fn about_shows_real_credits_and_opens_the_notices() {
     assert_eq!(states[1]["export"]["open"], false);
     assert_eq!(states[2]["about_open"], true, "escape steps back to About");
     assert_eq!(states[3]["about_open"], false);
+}
+
+#[test]
+fn clicking_a_clip_body_selects_it_and_places_the_cursor() {
+    let samples = Samples::new("body");
+    let states = run(&format!(
+        "{}\ntime 3.0\nstate\nkey ctrl+i\nstate\nkey ctrl+z\nrange 0.5 1.0\ntime 2.2\nstate\ntime 0.5\ntime 3.0 ctrl\nstate\nkey delete\nstate\n",
+        samples.import_line("import")
+    ));
+    assert_eq!(selected(&states[0]), ["line1"]);
+    assert!((states[0]["cursor"].as_f64().unwrap() - 3.0).abs() < 0.02);
+    assert_eq!(names(&states[1]).len(), 5, "still splits at the click");
+    assert!(selected(&states[2]).is_empty(), "the gap clears the selection");
+    assert_eq!(states[2]["range"], Value::Null);
+    assert_eq!(selected(&states[3]), ["intro", "line1"]);
+    assert_eq!(names(&states[4]), ["line2", "line10"]);
+}
+
+#[test]
+fn a_selected_clip_plays_as_a_region() {
+    let samples = Samples::new("region");
+    let states = run(&format!(
+        "{}\nclip line1\nkey space\nstate\nadvance 2\nstate\n",
+        samples.import_line("import")
+    ));
+    assert!((states[0]["playback"]["position"].as_f64().unwrap() - 2.5).abs() < 0.001);
+    assert_eq!(states[1]["playback"]["playing"], false, "stops at the clip's end");
+}
+
+#[test]
+fn dragging_snaps_to_edges_selects_the_clip_and_keeps_others_still() {
+    let samples = Samples::new("snap");
+    // intro 0-2, line1 2.5-3.5, line2 4-5, line10 5.5-6.5.
+    let states = run(&format!(
+        "{}\nmove line10 5.03\nstate\n",
+        samples.import_line("import")
+    ));
+    assert_eq!(starts(&states[0]), [0.0, 2.5, 4.0, 5.0]);
+    assert_eq!(selected(&states[0]), ["line10"]);
+}
+
+#[test]
+fn dropping_onto_a_clip_lands_beside_it() {
+    let samples = Samples::new("beside");
+    let states = run(&format!("{}\nmove line10 3.8\nstate\n", samples.import_line("import")));
+    // Its centre is before line2's, so it fits in the gap only by shifting line2.
+    assert_eq!(names(&states[0]), ["intro", "line1", "line10", "line2"]);
+    assert_eq!(starts(&states[0]), [0.0, 2.5, 3.5, 4.5]);
+}
+
+#[test]
+fn a_take_previews_live_and_becomes_a_clip_when_stopped() {
+    let samples = Samples::new("live");
+    let picture = samples.0.join("live.png");
+    let states = run(&format!(
+        "import {}\nkey r\nstate\nrecord-feed 1 0.5\nsleep 500\nscreenshot \"{}\"\nstate\nkey ctrl+z\nstate\nkey r\nrecord-wait\nstate\n",
+        samples.path("line1.wav"),
+        picture.display(),
+    ));
+    assert_eq!(states[0]["recording"]["live_levels"], 0);
+    assert_eq!(states[2]["recording"]["live_levels"], 100);
+    assert!((states[2]["recording"]["seconds"].as_f64().unwrap() - 1.0).abs() < 0.01);
+    assert_eq!(names(&states[2]), ["line1"], "not a real clip until it stops");
+    assert!(picture.exists());
+    assert_eq!(states[4]["recording"]["live_levels"], Value::Null);
+}
+
+#[test]
+fn escape_closes_a_menu_first_and_hotkeys_wait_behind_it() {
+    let samples = Samples::new("menukeys");
+    let states = run(&format!(
+        "{}\nmenu-clip line1\nkey delete\nstate\nkey escape\nstate\nkey delete\nstate\n",
+        samples.import_line("import")
+    ));
+    assert_eq!(names(&states[0]).len(), 4, "delete does nothing behind the menu");
+    assert_eq!(selected(&states[1]), ["line1"], "escape only closes the menu");
+    assert_eq!(names(&states[2]).len(), 3, "keys work again once it's closed");
+}
+
+#[test]
+fn conflict_cancel_and_copies_preserve_existing_exports() {
+    let samples = Samples::new("copies");
+    let out = samples.0.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("intro.wav"), b"original").unwrap();
+    std::fs::write(out.join("intro (2).wav"), b"existing copy").unwrap();
+    let states = run(&format!(
+        "{}\nkey ctrl+e\nexport folder \"{}\"\nbutton \"Export files\"\nstate\nbutton Cancel\nstate\nbutton \"Export files\"\nbutton \"Make copies\"\nexport-wait\nstate\n",
+        samples.import_line("import"), out.display(),
+    ));
+    assert_eq!(states[0]["export"]["conflict"], true);
+    assert_eq!(states[1]["export"]["conflict"], false);
+    assert_eq!(states[1]["export"]["open"], true);
+    assert_eq!(states[2]["export"]["report"]["written"], 4);
+    assert_eq!(std::fs::read(out.join("intro.wav")).unwrap(), b"original");
+    assert_eq!(std::fs::read(out.join("intro (2).wav")).unwrap(), b"existing copy");
+    assert!(hound::WavReader::open(out.join("intro (3).wav")).is_ok());
 }

@@ -19,6 +19,7 @@ audioadapter-buffers = "5"
 cpal = "0.18"
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "system_fonts"] }
 hound = "3.5"
+tempfile = "3.27"
 rfd = "0.17"
 rubato = "5"
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu"], optional = true }
