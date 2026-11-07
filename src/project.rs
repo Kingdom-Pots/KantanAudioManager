@@ -8,10 +8,10 @@ use crate::peaks::Peaks;
 pub type Frames = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SourceId(u32);
+pub struct SourceId(pub(crate) u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ClipId(u32);
+pub struct ClipId(pub(crate) u32);
 
 /// Converts a decibel change to a linear gain factor.
 pub fn db_to_gain(db: f32) -> f32 {
@@ -171,6 +171,81 @@ impl Clip {
     }
 }
 
+impl Clip {
+    /// The gain for a frame `local` frames into segment `index`. A segment
+    /// following audio at another gain eases in over 5 ms, so that amplifying
+    /// part of a clip can't cause an audible click at the edge.
+    pub fn gain_at(&self, index: usize, local: Frames, sample_rate: u32) -> f32 {
+        let SegmentKind::Audio { gain, .. } = self.segments[index].kind else {
+            return 0.0;
+        };
+        let ramp = sample_rate as Frames / 200;
+        let previous = index.checked_sub(1).map(|i| self.segments[i].kind);
+        if let Some(SegmentKind::Audio { gain: before, .. }) = previous
+            && before != gain
+            && local < ramp
+            && self.segments[index].len >= ramp
+        {
+            let t = (local + 1) as f32 / (ramp + 1) as f32;
+            return before + (gain - before) * t;
+        }
+        gain
+    }
+}
+
+/// What counts as a pause between lines.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SilenceSettings {
+    /// Anything quieter than this is silence.
+    pub threshold_db: f32,
+    /// A quiet stretch must last this long to count as a pause.
+    pub min_silence_seconds: f32,
+}
+
+impl Default for SilenceSettings {
+    fn default() -> Self {
+        Self { threshold_db: -40.0, min_silence_seconds: 0.5 }
+    }
+}
+
+/// Kept either side of each line, so soft starts and endings aren't cut off.
+const SILENCE_PADDING_SECONDS: f32 = 0.05;
+/// Sounds shorter than this are treated as clicks rather than lines.
+const MIN_SOUND_SECONDS: f32 = 0.03;
+
+/// The parts of some interleaved audio that are not silence, in frames.
+fn sound_regions(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    settings: SilenceSettings,
+) -> Vec<(Frames, Frames)> {
+    let frames = samples.len() / channels;
+    let threshold = db_to_gain(settings.threshold_db);
+    let to_frames = |seconds: f32| (seconds * sample_rate as f32) as usize;
+    let min_silence = to_frames(settings.min_silence_seconds).max(1);
+
+    // Runs of sound, joined across any quiet stretch too short to be a pause.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (index, frame) in samples.chunks_exact(channels).enumerate() {
+        if frame.iter().any(|s| s.abs() >= threshold) {
+            match runs.last_mut() {
+                Some((_, end)) if index - *end < min_silence => *end = index + 1,
+                _ => runs.push((index, index + 1)),
+            }
+        }
+    }
+
+    let padding = to_frames(SILENCE_PADDING_SECONDS);
+    let min_sound = to_frames(MIN_SOUND_SECONDS);
+    runs.into_iter()
+        .filter(|(start, end)| end - start >= min_sound)
+        .map(|(start, end)| {
+            (start.saturating_sub(padding) as Frames, (end + padding).min(frames) as Frames)
+        })
+        .collect()
+}
+
 /// A half-open span of the timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeRange {
@@ -208,6 +283,21 @@ impl Project {
         }
     }
 
+    pub(crate) fn next_ids(&self) -> (u32, u32) {
+        (self.next_source, self.next_clip)
+    }
+
+    /// Rebuilds a project from a file, whose contents have been checked.
+    pub(crate) fn from_parts(
+        sample_rate: u32,
+        sources: BTreeMap<SourceId, Arc<Source>>,
+        clips: Vec<Clip>,
+        next_source: u32,
+        next_clip: u32,
+    ) -> Self {
+        Self { sample_rate, sources, clips, next_source, next_clip }
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -241,6 +331,14 @@ impl Project {
         self.next_source += 1;
         self.sources.insert(id, Arc::new(source));
         id
+    }
+
+    /// The first `Recording N` name that no clip uses.
+    pub fn next_recording_name(&self) -> String {
+        (1..)
+            .map(|n| format!("Recording {n}"))
+            .find(|name| self.clips.iter().all(|c| c.name != *name))
+            .expect("an unused number always exists")
     }
 
     /// Adds a whole source as a new clip after the last one.
@@ -283,6 +381,67 @@ impl Project {
             self.index_of(id)?;
         }
         self.clips.retain(|c| !ids.contains(&c.id));
+        Ok(())
+    }
+
+    /// Removes part of the timeline, leaving a gap. A clip with its middle
+    /// removed becomes two clips.
+    pub fn delete_range(&mut self, range: TimeRange) -> Result<(), EditError> {
+        let touches = |c: &Clip| c.start < range.end && c.end() > range.start;
+        if range.start >= range.end || !self.clips.iter().any(touches) {
+            return Err(EditError::NothingSelected);
+        }
+        // The end goes first, so the part that survives gets the lowest number.
+        for at in [range.end, range.start] {
+            match self.split_at(at) {
+                Ok(_) | Err(EditError::NotInsideClip(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.clips.retain(|c| c.start < range.start || c.end() > range.end);
+        Ok(())
+    }
+
+    /// Cuts a clip into one clip per stretch of sound, removing the pauses and
+    /// keeping everything at its place on the timeline. The first part keeps the
+    /// name and the rest are numbered. It's `NoChange` if there's nothing to cut.
+    pub fn split_on_silence(&mut self, id: ClipId, settings: SilenceSettings) -> Result<(), EditError> {
+        let clip = &self.clips[self.index_of(id)?];
+        let (base, start, end) = (clip.name.clone(), clip.start, clip.end());
+        let rendered = crate::render_clip(self, clip);
+        let regions = sound_regions(
+            &rendered.samples,
+            rendered.channels as usize,
+            self.sample_rate,
+            settings,
+        );
+        let whole = regions.as_slice() == [(0, end - start)];
+        if regions.is_empty() || whole {
+            return Err(EditError::NoChange);
+        }
+
+        // Everything between the regions goes, working backwards so positions hold.
+        let mut gaps = Vec::new();
+        let mut position = start;
+        for (from, to) in &regions {
+            gaps.push((position, start + from));
+            position = start + to;
+        }
+        gaps.push((position, end));
+        for (from, to) in gaps.into_iter().rev().filter(|(from, to)| from < to) {
+            self.delete_range(TimeRange::new(from, to))?;
+        }
+
+        // Clear the names first, so numbering runs in timeline order.
+        let pieces: Vec<usize> = (0..self.clips.len())
+            .filter(|&i| self.clips[i].start >= start && self.clips[i].end() <= end)
+            .collect();
+        for &index in &pieces {
+            self.clips[index].name.clear();
+        }
+        for (order, &index) in pieces.iter().enumerate() {
+            self.clips[index].name = if order == 0 { base.clone() } else { self.numbered_name(&base) };
+        }
         Ok(())
     }
 

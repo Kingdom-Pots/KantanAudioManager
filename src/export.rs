@@ -26,12 +26,32 @@ pub struct NameOptions {
     pub prefix: String,
     pub suffix: String,
     pub numbering: Option<Numbering>,
+    /// Without the dot.
+    pub extension: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitDepth {
     Bits16,
     Bits24,
+}
+
+/// What to write. MP3 is 192 kbps and OGG is Vorbis at quality 6, both good for voice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Wav(BitDepth),
+    Mp3,
+    Ogg,
+}
+
+impl OutputFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Wav(_) => "wav",
+            Self::Mp3 => "mp3",
+            Self::Ogg => "ogg",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +99,7 @@ pub fn plan_files(
         .iter()
         .enumerate()
         .map(|(index, (stem, sanitized))| {
-            let file_name = format!("{stem}.wav");
+            let file_name = format!("{stem}.{}", options.extension);
             let duplicate = lowered.iter().filter(|other| **other == lowered[index]).count() > 1;
             let problem = if duplicate {
                 Some(FileProblem::Duplicate)
@@ -140,7 +160,7 @@ pub fn export_clips(
     project: &Project,
     files: &[(ClipId, PathBuf)],
     sample_rate: u32,
-    depth: BitDepth,
+    format: OutputFormat,
     mut progress: impl FnMut(usize),
 ) -> ExportReport {
     let mut report = ExportReport::default();
@@ -148,7 +168,7 @@ pub fn export_clips(
         let shown = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        match write_clip(project, *id, path, sample_rate, depth) {
+        match write_clip(project, *id, path, sample_rate, format) {
             Ok(clipped) => {
                 report.written += 1;
                 if clipped {
@@ -168,7 +188,7 @@ fn write_clip(
     id: ClipId,
     path: &Path,
     sample_rate: u32,
-    depth: BitDepth,
+    format: OutputFormat,
 ) -> Result<bool, String> {
     let clip = project.clip(id).ok_or("the clip no longer exists")?;
     let rendered = render_clip(project, clip);
@@ -184,7 +204,12 @@ fn write_clip(
     let mut temp = path.as_os_str().to_owned();
     temp.push(".part");
     let temp = PathBuf::from(temp);
-    let result = write_wav(&temp, &samples, rendered.channels, sample_rate, depth)
+    let channels = rendered.channels;
+    let result = match format {
+        OutputFormat::Wav(depth) => write_wav(&temp, &samples, channels, sample_rate, depth),
+        OutputFormat::Mp3 => write_mp3(&temp, &samples, channels, sample_rate),
+        OutputFormat::Ogg => write_ogg(&temp, &samples, channels, sample_rate),
+    }
         .and_then(|()| std::fs::rename(&temp, path).map_err(|e| e.to_string()));
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -227,13 +252,71 @@ fn write_wav(
     writer.finalize().map_err(error)
 }
 
+fn write_mp3(path: &Path, samples: &[f32], channels: u16, sample_rate: u32) -> Result<(), String> {
+    use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, MonoPcm};
+
+    let error = |e: &dyn std::fmt::Debug| format!("MP3 encoder: {e:?}");
+    let mut encoder = Builder::new()
+        .ok_or("MP3 encoder: couldn't start")?
+        .with_num_channels(channels as u8)
+        .map_err(|e| error(&e))?
+        .with_sample_rate(sample_rate)
+        .map_err(|e| error(&e))?
+        .with_brate(Bitrate::Kbps192)
+        .map_err(|e| error(&e))?
+        .with_quality(mp3lame_encoder::Quality::Best)
+        .map_err(|e| error(&e))?
+        .build()
+        .map_err(|e| error(&e))?;
+
+    let pcm: Vec<i16> = samples
+        .iter()
+        .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+        .collect();
+    let mut output = Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(pcm.len()));
+    if channels == 1 {
+        encoder.encode_to_vec(MonoPcm(&pcm), &mut output).map_err(|e| error(&e))?;
+    } else {
+        encoder.encode_to_vec(InterleavedPcm(&pcm), &mut output).map_err(|e| error(&e))?;
+    }
+    encoder.flush_to_vec::<FlushNoGap>(&mut output).map_err(|e| error(&e))?;
+    std::fs::write(path, output).map_err(|e| e.to_string())
+}
+
+fn write_ogg(path: &Path, samples: &[f32], channels: u16, sample_rate: u32) -> Result<(), String> {
+    use std::num::{NonZeroU8, NonZeroU32};
+    use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoderBuilder};
+
+    let rate = NonZeroU32::new(sample_rate).ok_or("invalid sample rate")?;
+    let count = NonZeroU8::new(channels as u8).ok_or("invalid channel count")?;
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let error = |e: vorbis_rs::VorbisError| format!("OGG encoder: {e}");
+    let mut encoder = VorbisEncoderBuilder::new(rate, count, std::io::BufWriter::new(file))
+        .map_err(error)?
+        .bitrate_management_strategy(VorbisBitrateManagementStrategy::QualityVbr { target_quality: 0.6 })
+        .build()
+        .map_err(error)?;
+
+    let width = channels as usize;
+    for block in samples.chunks(4096 * width) {
+        let planes: Vec<Vec<f32>> = (0..width)
+            .map(|channel| {
+                block.iter().skip(channel).step_by(width).map(|s| s.clamp(-1.0, 1.0)).collect()
+            })
+            .collect();
+        encoder.encode_audio_block(&planes).map_err(error)?;
+    }
+    encoder.finish().map_err(error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TimeRange;
+    use crate::{Source, TimeRange};
 
     fn options() -> NameOptions {
-        NameOptions { prefix: String::new(), suffix: String::new(), numbering: None }
+        NameOptions { prefix: String::new(), suffix: String::new(), numbering: None, extension: "wav" }
     }
 
     fn numbering(position: NumberPosition, start: u32, padding: usize) -> Option<Numbering> {
@@ -242,6 +325,56 @@ mod tests {
 
     fn names(files: &[PlannedFile]) -> Vec<&str> {
         files.iter().map(|f| f.file_name.as_str()).collect()
+    }
+
+    /// Encodes one second of tone, then decodes it again with the import code.
+    fn round_trip(format: OutputFormat, channels: u16) -> Source {
+        let dir = TempDir::new(&format!("{}{channels}", format.extension()));
+        let path = dir.0.join(format!("a.{}", format.extension()));
+        let samples: Vec<f32> = (0..48000)
+            .flat_map(|i| {
+                let v = (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 0.5;
+                std::iter::repeat_n(v, channels as usize)
+            })
+            .collect();
+        let (project, id) = project_with_clip(channels, samples);
+        let report = export_clips(&project, &[(id, path.clone())], 44100, format, |_| {});
+        assert_eq!(report.failed, Vec::<String>::new());
+        crate::import::import_file(&path, 44100).unwrap()
+    }
+
+    #[test]
+    fn mp3_and_ogg_decode_back_to_the_same_audio() {
+        for format in [OutputFormat::Mp3, OutputFormat::Ogg] {
+            for channels in [1, 2] {
+                let source = round_trip(format, channels);
+                assert_eq!(source.channels, channels, "{format:?}");
+                // Lossy formats pad the ends a little.
+                let frames = source.frames() as i64;
+                assert!((frames - 44100).abs() < 4000, "{format:?} {channels}: {frames}");
+                let (lo, hi) = source.min_max(10000, 20000);
+                assert!((hi - 0.5).abs() < 0.05 && (lo + 0.5).abs() < 0.05, "{format:?}: {lo} {hi}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_offered_sample_rate_encodes() {
+        for rate in [48000, 44100, 32000, 22050, 16000] {
+            for format in [OutputFormat::Mp3, OutputFormat::Ogg] {
+                let dir = TempDir::new(&format!("rate{rate}{}", format.extension()));
+                let path = dir.0.join("a");
+                let (project, id) = project_with_clip(1, vec![0.25; 48000]);
+                let report = export_clips(&project, &[(id, path)], rate, format, |_| {});
+                assert_eq!(report.written, 1, "{format:?} at {rate}: {:?}", report.failed);
+            }
+        }
+    }
+
+    #[test]
+    fn the_extension_follows_the_format() {
+        let opts = NameOptions { extension: OutputFormat::Mp3.extension(), ..options() };
+        assert_eq!(names(&plan_files(&["a"], &opts, |_| false)), ["a.mp3"]);
     }
 
     #[test]
@@ -257,6 +390,7 @@ mod tests {
             prefix: "SFX_".to_owned(),
             suffix: "_final".to_owned(),
             numbering: numbering(NumberPosition::BeforeName, 1, 3),
+            extension: "wav",
         };
         let files = plan_files(&["Explosion", "Door"], &opts, |_| false);
         assert_eq!(names(&files), ["SFX_001_Explosion_final.wav", "SFX_002_Door_final.wav"]);
@@ -337,7 +471,7 @@ mod tests {
         let (project, id) = project_with_clip(2, vec![0.5, -0.5, 1.0, -1.0]);
 
         let mut seen = Vec::new();
-        let report = export_clips(&project, &[(id, path.clone())], 48000, BitDepth::Bits16, |n| seen.push(n));
+        let report = export_clips(&project, &[(id, path.clone())], 48000, OutputFormat::Wav(BitDepth::Bits16), |n| seen.push(n));
 
         assert_eq!(report, ExportReport { written: 1, ..Default::default() });
         assert_eq!(seen, [1]);
@@ -354,7 +488,7 @@ mod tests {
         let path = dir.0.join("a.wav");
         let (project, id) = project_with_clip(1, vec![0.25; 48000]);
 
-        export_clips(&project, &[(id, path.clone())], 44100, BitDepth::Bits24, |_| {});
+        export_clips(&project, &[(id, path.clone())], 44100, OutputFormat::Wav(BitDepth::Bits24), |_| {});
 
         let mut reader = hound::WavReader::open(&path).unwrap();
         let spec = reader.spec();
@@ -371,7 +505,7 @@ mod tests {
         let (mut project, id) = project_with_clip(1, vec![0.5, 0.5]);
         project.amplify(TimeRange::new(0, 1), 20.0).unwrap();
 
-        let report = export_clips(&project, &[(id, path.clone())], 48000, BitDepth::Bits16, |_| {});
+        let report = export_clips(&project, &[(id, path.clone())], 48000, OutputFormat::Wav(BitDepth::Bits16), |_| {});
 
         assert_eq!(report.clipped, ["a.wav"]);
         let values: Vec<i16> = hound::WavReader::open(&path).unwrap().samples().map(Result::unwrap).collect();
@@ -385,7 +519,7 @@ mod tests {
         std::fs::write(&path, b"old").unwrap();
         let (project, id) = project_with_clip(1, vec![0.5]);
 
-        export_clips(&project, &[(id, path.clone())], 48000, BitDepth::Bits16, |_| {});
+        export_clips(&project, &[(id, path.clone())], 48000, OutputFormat::Wav(BitDepth::Bits16), |_| {});
 
         assert!(hound::WavReader::open(&path).is_ok());
         assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
@@ -398,7 +532,7 @@ mod tests {
         let bad = dir.0.join("missing_folder").join("bad.wav");
         let good = dir.0.join("good.wav");
 
-        let report = export_clips(&project, &[(id, bad), (id, good.clone())], 48000, BitDepth::Bits16, |_| {});
+        let report = export_clips(&project, &[(id, bad), (id, good.clone())], 48000, OutputFormat::Wav(BitDepth::Bits16), |_| {});
 
         assert_eq!(report.written, 1);
         assert_eq!(report.failed.len(), 1);

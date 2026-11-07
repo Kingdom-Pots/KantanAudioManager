@@ -265,3 +265,100 @@ fn merging_mono_with_stereo_renders_stereo() {
     assert_eq!(out.samples.len(), (2 + GAP as usize + 1) * 2);
     assert_eq!(&out.samples[out.samples.len() - 2..], [1.0, 2.0]);
 }
+
+#[test]
+fn deleting_a_range_inside_a_clip_splits_it_and_leaves_a_gap() {
+    let mut p = Project::new(RATE);
+    let a = add_ramp(&mut p, "Line", 0, 10);
+    p.delete_range(TimeRange::new(3, 6)).unwrap();
+    assert_eq!(names(&p), ["Line", "Line 2"]);
+    assert_eq!(starts(&p), [0, 6]);
+    assert_eq!(rendered(&p, a), ramp(0, 3));
+    assert_eq!(rendered(&p, p.clips()[1].id), ramp(6, 4));
+}
+
+#[test]
+fn deleting_a_range_trims_edges_and_removes_covered_clips() {
+    let mut p = Project::new(RATE);
+    add_ramp(&mut p, "a", 0, 10); // 0..10
+    add_ramp(&mut p, "b", 0, 10); // 60..70
+    let c = add_ramp(&mut p, "c", 0, 10); // 120..130
+    p.delete_range(TimeRange::new(5, 125)).unwrap();
+    assert_eq!(names(&p), ["a", "c 2"]);
+    assert_eq!(starts(&p), [0, 125]);
+    assert!(p.clip(c).is_none() || p.clip(c).unwrap().len() == 5);
+    assert_eq!(p.delete_range(TimeRange::new(40, 50)), Err(EditError::NothingSelected));
+    assert_eq!(p.delete_range(TimeRange::new(3, 3)), Err(EditError::NothingSelected));
+}
+
+#[test]
+fn amplify_edges_ease_instead_of_jumping() {
+    let mut p = Project::new(48000);
+    let source = p.add_source(1, vec![0.1; 4800]).unwrap();
+    let a = p.append_clip("a", source).unwrap();
+    p.amplify(TimeRange::new(1000, 2000), 20.0).unwrap();
+    let out = rendered(&p, a);
+    let biggest_step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+    assert!(biggest_step < 0.01, "{biggest_step}");
+    assert!((out[1500] - 1.0).abs() < 1e-3 && (out[500] - 0.1).abs() < 1e-6);
+    assert!((out[2500] - 0.1).abs() < 1e-6);
+}
+
+/// Sound and silence by turns, in tenths of a second at 1000 Hz.
+fn add_pattern(p: &mut Project, name: &str, pattern: &[(f32, usize)]) -> ClipId {
+    let samples: Vec<f32> = pattern
+        .iter()
+        .flat_map(|&(level, tenths)| std::iter::repeat_n(level, tenths * 100))
+        .collect();
+    let source = p.add_source(1, samples).unwrap();
+    p.append_clip(name, source).unwrap()
+}
+
+const PAUSES: SilenceSettings = SilenceSettings { threshold_db: -40.0, min_silence_seconds: 0.5 };
+
+#[test]
+fn silence_splits_one_clip_per_line_and_removes_pauses() {
+    let mut p = Project::new(1000);
+    let a = add_pattern(&mut p, "Take", &[(0.0, 10), (0.5, 10), (0.0, 10), (0.5, 20), (0.0, 10)]);
+    p.split_on_silence(a, PAUSES).unwrap();
+    assert_eq!(names(&p), ["Take", "Take 2"]);
+    // Sound is at 1000..2000 and 3000..5000, with 50 ms kept around it.
+    assert_eq!(starts(&p), [950, 2950]);
+    assert_eq!(p.clips()[0].len(), 1100);
+    assert_eq!(p.clips()[1].len(), 2100);
+}
+
+#[test]
+fn short_pauses_stay_inside_a_line() {
+    let mut p = Project::new(1000);
+    let a = add_pattern(&mut p, "Take", &[(0.5, 10), (0.0, 3), (0.5, 10)]);
+    assert_eq!(p.split_on_silence(a, PAUSES), Err(EditError::NoChange));
+    assert_eq!(names(&p), ["Take"]);
+}
+
+#[test]
+fn the_threshold_decides_what_counts_as_silence() {
+    let mut p = Project::new(1000);
+    let a = add_pattern(&mut p, "Take", &[(0.5, 10), (0.05, 10), (0.5, 10)]);
+    assert_eq!(p.split_on_silence(a, PAUSES), Err(EditError::NoChange));
+    let strict = SilenceSettings { threshold_db: -20.0, ..PAUSES };
+    p.split_on_silence(a, strict).unwrap();
+    assert_eq!(names(&p), ["Take", "Take 2"]);
+}
+
+#[test]
+fn entirely_silent_clips_and_lone_clicks_are_left_alone() {
+    let mut p = Project::new(1000);
+    let a = add_pattern(&mut p, "Quiet", &[(0.0, 20)]);
+    assert_eq!(p.split_on_silence(a, PAUSES), Err(EditError::NoChange));
+    assert_eq!(names(&p), ["Quiet"]);
+}
+
+#[test]
+fn numbering_avoids_names_already_used() {
+    let mut p = Project::new(1000);
+    add_pattern(&mut p, "Take 2", &[(0.5, 1)]);
+    let a = add_pattern(&mut p, "Take", &[(0.5, 10), (0.0, 10), (0.5, 10), (0.0, 10), (0.5, 10)]);
+    p.split_on_silence(a, PAUSES).unwrap();
+    assert_eq!(names(&p), ["Take 2", "Take", "Take 3", "Take 4"]);
+}

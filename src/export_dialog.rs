@@ -6,9 +6,11 @@ use std::sync::mpsc::{self, Receiver};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::export::{
-    BitDepth, ExportReport, FileProblem, NameOptions, NumberPosition, Numbering, PlannedFile,
+    BitDepth, ExportReport, FileProblem, NameOptions, NumberPosition, Numbering, OutputFormat,
+    PlannedFile,
     export_clips, plan_files,
 };
+use crate::project_file::Settings;
 use crate::{ClipId, Project};
 
 const SAMPLE_RATES: [u32; 5] = [48000, 44100, 32000, 22050, 16000];
@@ -26,6 +28,23 @@ struct Job {
     done: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFormat {
+    Wav,
+    Mp3,
+    Ogg,
+}
+
+impl FileFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wav => "WAV",
+            Self::Mp3 => "MP3",
+            Self::Ogg => "OGG",
+        }
+    }
+}
+
 /// The settings, kept between exports so a batch can be repeated easily.
 pub struct ExportSettings {
     pub folder: Option<PathBuf>,
@@ -37,13 +56,84 @@ pub struct ExportSettings {
     pub number_padding: usize,
     pub sample_rate: u32,
     pub depth: BitDepth,
+    pub format: FileFormat,
     pub only_selected: bool,
     pub overwrite: bool,
 }
 
 impl ExportSettings {
+    /// The settings worth keeping in a project file. Overwriting isn't one of
+    /// them, because it should always be a deliberate choice.
+    pub fn to_pairs(&self) -> Settings {
+        let mut pairs = vec![
+            ("prefix", self.names.prefix.clone()),
+            ("suffix", self.names.suffix.clone()),
+            ("numbering", self.numbering_enabled.to_string()),
+            ("number_after", (self.number_position == NumberPosition::AfterName).to_string()),
+            ("number_start", self.number_start.to_string()),
+            ("number_padding", self.number_padding.to_string()),
+            ("sample_rate", self.sample_rate.to_string()),
+            ("bits24", (self.depth == BitDepth::Bits24).to_string()),
+            ("format", self.format.label().to_owned()),
+        ];
+        if let Some(folder) = &self.folder {
+            pairs.push(("folder", folder.display().to_string()));
+        }
+        pairs.into_iter().map(|(name, value)| (name.to_owned(), value)).collect()
+    }
+
+    /// Applies saved settings, ignoring anything unrecognized or out of range.
+    pub fn apply_pairs(&mut self, pairs: &Settings) {
+        for (name, value) in pairs {
+            match name.as_str() {
+                "prefix" => self.names.prefix = value.clone(),
+                "suffix" => self.names.suffix = value.clone(),
+                "folder" => self.folder = Some(PathBuf::from(value)),
+                "numbering" => self.numbering_enabled = value == "true",
+                "number_after" => {
+                    self.number_position = if value == "true" {
+                        NumberPosition::AfterName
+                    } else {
+                        NumberPosition::BeforeName
+                    };
+                }
+                "number_start" => self.number_start = value.parse().unwrap_or(self.number_start),
+                "number_padding" => {
+                    let padding = value.parse().unwrap_or(self.number_padding);
+                    self.number_padding = padding.clamp(1, 6);
+                }
+                "sample_rate" => {
+                    let rate = value.parse().unwrap_or(self.sample_rate);
+                    if SAMPLE_RATES.contains(&rate) {
+                        self.sample_rate = rate;
+                    }
+                }
+                "format" => {
+                    self.format = match value.as_str() {
+                        "MP3" => FileFormat::Mp3,
+                        "OGG" => FileFormat::Ogg,
+                        _ => FileFormat::Wav,
+                    };
+                }
+                "bits24" => {
+                    self.depth = if value == "true" { BitDepth::Bits24 } else { BitDepth::Bits16 };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn output_format(&self) -> OutputFormat {
+        match self.format {
+            FileFormat::Wav => OutputFormat::Wav(self.depth),
+            FileFormat::Mp3 => OutputFormat::Mp3,
+            FileFormat::Ogg => OutputFormat::Ogg,
+        }
+    }
+
     fn name_options(&self) -> NameOptions {
         NameOptions {
+            extension: self.output_format().extension(),
             numbering: self.numbering_enabled.then_some(Numbering {
                 position: self.number_position,
                 start: self.number_start,
@@ -67,13 +157,14 @@ impl Default for ExportDialog {
             open: false,
             settings: ExportSettings {
                 folder: None,
-                names: NameOptions { prefix: String::new(), suffix: String::new(), numbering: None },
+                names: NameOptions { prefix: String::new(), suffix: String::new(), numbering: None, extension: "wav" },
                 numbering_enabled: false,
                 number_position: NumberPosition::BeforeName,
                 number_start: 1,
                 number_padding: 3,
                 sample_rate: 48000,
                 depth: BitDepth::Bits16,
+                format: FileFormat::Wav,
                 only_selected: false,
                 overwrite: false,
             },
@@ -148,13 +239,13 @@ impl ExportDialog {
 
         let total = files.len();
         let project = project.clone();
-        let (rate, depth) = (self.settings.sample_rate, self.settings.depth);
+        let (rate, format) = (self.settings.sample_rate, self.settings.output_format());
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         self.report = None;
         std::thread::spawn(move || {
             let report = match std::fs::create_dir_all(&folder) {
-                Ok(()) => export_clips(&project, &files, rate, depth, |done| {
+                Ok(()) => export_clips(&project, &files, rate, format, |done| {
                     let _ = sender.send(JobMessage::Progress(done));
                     ctx.request_repaint();
                 }),
@@ -225,7 +316,7 @@ impl ExportDialog {
     ) {
         let s = &mut self.settings;
         ui.horizontal(|ui| {
-            if ui.button("Folder...").clicked() {
+            if ui.button("Folder...").on_hover_text("Choose where the files go").clicked() {
                 if native_dialogs {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         s.folder = Some(folder);
@@ -235,18 +326,25 @@ impl ExportDialog {
                 }
             }
             match &s.folder {
-                Some(folder) => ui.label(folder.display().to_string()),
+                // Long paths and names must not stretch the window off screen.
+                Some(folder) => {
+                    let path = folder.display().to_string();
+                    ui.add(egui::Label::new(&path).truncate()).on_hover_text(&path)
+                }
                 None => ui.colored_label(WARNING, "Choose a folder to export to"),
             };
         });
         ui.horizontal(|ui| {
             ui.label("Prefix");
-            ui.add(egui::TextEdit::singleline(&mut s.names.prefix).desired_width(150.0));
+            ui.add(egui::TextEdit::singleline(&mut s.names.prefix).desired_width(150.0))
+                .on_hover_text("Added to the start of every filename");
             ui.label("Suffix");
-            ui.add(egui::TextEdit::singleline(&mut s.names.suffix).desired_width(150.0));
+            ui.add(egui::TextEdit::singleline(&mut s.names.suffix).desired_width(150.0))
+                .on_hover_text("Added to the end of every filename, before the extension");
         });
         ui.horizontal(|ui| {
-            ui.checkbox(&mut s.numbering_enabled, "Numbering");
+            ui.checkbox(&mut s.numbering_enabled, "Numbering")
+                .on_hover_text("Number the files in timeline order");
             ui.add_enabled_ui(s.numbering_enabled, |ui| {
                 egui::ComboBox::from_id_salt("number_position")
                     .selected_text(match s.number_position {
@@ -256,14 +354,29 @@ impl ExportDialog {
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut s.number_position, NumberPosition::BeforeName, "Before name");
                         ui.selectable_value(&mut s.number_position, NumberPosition::AfterName, "After name");
-                    });
+                    })
+                    .response
+                    .on_hover_text("Where the number goes in the filename");
                 ui.label("Start");
-                ui.add(egui::DragValue::new(&mut s.number_start));
+                ui.add(egui::DragValue::new(&mut s.number_start))
+                    .on_hover_text("The first file's number");
                 ui.label("Digits");
-                ui.add(egui::DragValue::new(&mut s.number_padding).range(1..=6));
+                ui.add(egui::DragValue::new(&mut s.number_padding).range(1..=6))
+                    .on_hover_text("Minimum digits. 3 gives 001, 002, 003.");
             });
         });
         ui.horizontal(|ui| {
+            ui.label("Format");
+            egui::ComboBox::from_id_salt("file_format")
+                .selected_text(s.format.label())
+                .width(70.0)
+                .show_ui(ui, |ui| {
+                    for format in [FileFormat::Wav, FileFormat::Mp3, FileFormat::Ogg] {
+                        ui.selectable_value(&mut s.format, format, format.label());
+                    }
+                })
+                .response
+                .on_hover_text("WAV is uncompressed. MP3 (192 kbps) and OGG (quality 6) make smaller files.");
             ui.label("Sample rate");
             egui::ComboBox::from_id_salt("sample_rate")
                 .selected_text(format!("{} Hz", s.sample_rate))
@@ -271,24 +384,36 @@ impl ExportDialog {
                     for rate in SAMPLE_RATES {
                         ui.selectable_value(&mut s.sample_rate, rate, format!("{rate} Hz"));
                     }
-                });
-            ui.label("Bit depth");
-            egui::ComboBox::from_id_salt("bit_depth")
-                .selected_text(match s.depth {
-                    BitDepth::Bits16 => "16-bit",
-                    BitDepth::Bits24 => "24-bit",
                 })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut s.depth, BitDepth::Bits16, "16-bit");
-                    ui.selectable_value(&mut s.depth, BitDepth::Bits24, "24-bit");
-                });
+                .response
+                .on_hover_text("48000 or 44100 Hz suit most uses. Lower rates make smaller files with less detail.");
+            // Only WAV has a bit depth.
+            ui.add_enabled_ui(s.format == FileFormat::Wav, |ui| {
+                ui.label("Bit depth");
+                egui::ComboBox::from_id_salt("bit_depth")
+                    .selected_text(match s.depth {
+                        BitDepth::Bits16 => "16-bit",
+                        BitDepth::Bits24 => "24-bit",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.depth, BitDepth::Bits16, "16-bit");
+                        ui.selectable_value(&mut s.depth, BitDepth::Bits24, "24-bit");
+                    })
+                    .response
+                    .on_hover_text("WAV precision. 16-bit suits most uses.")
+                    .on_disabled_hover_text("Only WAV has a bit depth");
+            });
         });
         ui.horizontal(|ui| {
-            ui.radio_value(&mut s.only_selected, false, "All clips");
+            ui.radio_value(&mut s.only_selected, false, "All clips")
+                .on_hover_text("Export every clip on the track");
             ui.add_enabled_ui(any_selected, |ui| {
-                ui.radio_value(&mut s.only_selected, true, "Selected clips");
+                ui.radio_value(&mut s.only_selected, true, "Selected clips")
+                    .on_hover_text("Export only the clips you selected")
+                    .on_disabled_hover_text("No clips are selected");
             });
-            ui.checkbox(&mut s.overwrite, "Overwrite existing files");
+            ui.checkbox(&mut s.overwrite, "Overwrite existing files")
+                .on_hover_text("Replace files that already have these names");
         });
     }
 
@@ -305,12 +430,19 @@ impl ExportDialog {
         }
         ui.horizontal(|ui| {
             let can_start = self.can_start(plan);
-            let export = ui.add_enabled(can_start, egui::Button::new("Export files"));
+            let export = ui
+                .add_enabled(can_start, egui::Button::new("Export files"))
+                .on_hover_text("Write the files listed above")
+                .on_disabled_hover_text("Choose a folder and fix any problems shown in red first");
             if export.clicked() {
                 self.start(ctx, project, selected, plan);
             }
             let running = self.job.is_some();
-            if ui.add_enabled(!running, egui::Button::new("Close")).clicked() {
+            let close = ui
+                .add_enabled(!running, egui::Button::new("Close"))
+                .on_hover_text("Close this window. Your settings are kept. (Esc)")
+                .on_disabled_hover_text("Wait for the export to finish");
+            if close.clicked() {
                 self.open = false;
             }
             if let Some(job) = &self.job {
@@ -332,7 +464,13 @@ fn preview_ui(ui: &mut egui::Ui, plan: &[PlannedFile], overwrite: bool) {
         .show(ui, |ui| {
             for file in plan {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&file.file_name).monospace());
+                    // Leave room for any problem shown beside the name.
+                    ui.set_max_width(540.0);
+                    let name = RichText::new(&file.file_name).monospace();
+                    ui.scope(|ui| {
+                        ui.set_max_width(320.0);
+                        ui.add(egui::Label::new(name).truncate()).on_hover_text(&file.file_name);
+                    });
                     match file.problem {
                         Some(FileProblem::Duplicate) => {
                             ui.colored_label(PROBLEM, "same name as another clip");

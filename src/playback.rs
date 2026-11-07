@@ -16,14 +16,15 @@ fn stereo_frame(project: &Project, frame: Frames) -> [f32; 2] {
         return [0.0; 2];
     };
     let mut local = frame - clip.start;
-    for segment in &clip.segments {
+    for (index, segment) in clip.segments.iter().enumerate() {
         if local < segment.len {
-            let SegmentKind::Audio { source, offset, gain } = segment.kind else {
+            let SegmentKind::Audio { source, offset, .. } = segment.kind else {
                 return [0.0; 2];
             };
             let Some(source) = project.source(source) else {
                 return [0.0; 2];
             };
+            let gain = clip.gain_at(index, local, project.sample_rate());
             let width = source.channels as usize;
             let first = (offset + local) as usize * width;
             let right = first + width - 1;

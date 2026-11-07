@@ -12,6 +12,7 @@ use eframe::egui::{self, Modifiers, MouseWheelSource, MouseWheelUnit, PointerBut
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use kantan_audio_manager::app::App;
+use kantan_audio_manager::export_dialog::FileFormat;
 use kantan_audio_manager::export::{BitDepth, FileProblem, NumberPosition};
 use kantan_audio_manager::peaks::clip_min_max;
 use serde_json::json;
@@ -35,11 +36,32 @@ Commands, one per line. # starts a comment, and \"quotes\" allow spaces.
   drag X1 Y1 X2 Y2 [MODS]    Drag between positions, in points
   export KEY VALUE           Set an option in the open export window:
                              folder, prefix, suffix, rate, overwrite on|off,
-                             bits 16|24, scope all|selected,
+                             format wav|mp3|ogg, bits 16|24, scope all|selected,
                              numbering off|before|after, start, digits
   export-wait                Wait for a running export to finish
   advance SECONDS            Pull playing audio as a sound device would;
                              state then shows the peak heard
+  double NAME                Double-click a clip's header
+  menu-clip NAME             Right-click a clip's header; then use button LABEL
+  menu-time SECONDS          Right-click the lane at a time
+  move NAME SECONDS          Drag a clip by its header to a new start time
+  move-hold NAME SECONDS     Same, but keep the button held to inspect the drag
+  release                    Let go of a held drag
+  type TEXT                  Type into the focused text box
+  amplify-db DB              Set the gain in the open amplify window
+  record-feed SECONDS LEVEL  Deliver a tone to a take, as a microphone would
+  record-wait                Wait for a stopped take to be added
+  import-wait                Wait for an import started by something else
+  sleep MILLISECONDS         Give background threads real time to work
+  menu-button LABEL          Right-click a toolbar button
+  silence DB SECONDS         Set what counts as a pause
+  expect-tip LABEL TEXT      Hover a control and fail unless its tooltip has TEXT
+  expect-text TEXT           Fail unless the window shows TEXT
+  save PATH                  Save the project to a path
+  open PATH                  Open a project, asking about unsaved changes
+  close                      Ask to close the window
+  autosave-now               Write the recovery file and wait for it
+  crash                      End the process at once, with no cleanup
   state                      Print the app's state as one line of JSON
   screenshot PATH            Render the window to a PNG file
 
@@ -68,6 +90,27 @@ enum Command {
     Drag(Pos2, Pos2, Modifiers),
     ExportSet(String, String),
     ExportWait,
+    ImportWait,
+    ExpectText(String),
+    ExpectTip(String, String),
+    MenuButton(String),
+    Silence(f32, f32),
+    Sleep(u64),
+    Save(PathBuf),
+    Open(PathBuf),
+    Close,
+    AutosaveNow,
+    Crash,
+    RecordFeed(f64, f32),
+    RecordWait,
+    Double(String),
+    MenuClip(String),
+    MenuTime(f64),
+    Move(String, f64),
+    MoveHold(String, f64),
+    Release,
+    Type(String),
+    AmplifyDb(f32),
     Advance(f64),
     State,
     Screenshot(PathBuf),
@@ -175,6 +218,27 @@ fn parse(line: &str) -> Result<Option<Command>, String> {
         ("export", [key, value]) => Command::ExportSet(key.clone(), value.clone()),
         ("export-wait", []) => Command::ExportWait,
         ("advance", [seconds]) => Command::Advance(number(seconds)?),
+        ("double", [name]) => Command::Double(name.clone()),
+        ("menu-clip", [name]) => Command::MenuClip(name.clone()),
+        ("menu-time", [seconds]) => Command::MenuTime(number(seconds)?),
+        ("move", [name, seconds]) => Command::Move(name.clone(), number(seconds)?),
+        ("move-hold", [name, seconds]) => Command::MoveHold(name.clone(), number(seconds)?),
+        ("release", []) => Command::Release,
+        ("type", [text]) => Command::Type(text.clone()),
+        ("amplify-db", [db]) => Command::AmplifyDb(number(db)?),
+        ("record-feed", [seconds, level]) => Command::RecordFeed(number(seconds)?, number(level)?),
+        ("record-wait", []) => Command::RecordWait,
+        ("sleep", [ms]) => Command::Sleep(number(ms)?),
+        ("menu-button", [label]) => Command::MenuButton(label.clone()),
+        ("silence", [db, seconds]) => Command::Silence(number(db)?, number(seconds)?),
+        ("expect-tip", [label, text]) => Command::ExpectTip(label.clone(), text.clone()),
+        ("expect-text", [text]) => Command::ExpectText(text.clone()),
+        ("import-wait", []) => Command::ImportWait,
+        ("save", [path]) => Command::Save(PathBuf::from(path)),
+        ("open", [path]) => Command::Open(PathBuf::from(path)),
+        ("close", []) => Command::Close,
+        ("autosave-now", []) => Command::AutosaveNow,
+        ("crash", []) => Command::Crash,
         ("state", []) => Command::State,
         ("screenshot", [path]) => Command::Screenshot(PathBuf::from(path)),
         (other, _) => return Err(format!("unknown command or wrong arguments: '{other}'")),
@@ -199,6 +263,7 @@ impl egui::DroppedFile for DroppedPath {
 struct Bridge {
     harness: Harness<'static, App>,
     last_peak: f32,
+    held: Option<Pos2>,
 }
 
 impl Bridge {
@@ -217,7 +282,7 @@ impl Bridge {
             })
             .wgpu()
             .build_eframe(|creation| App::headless(&creation.egui_ctx));
-        Self { harness, last_peak: 0.0 }
+        Self { harness, last_peak: 0.0, held: None }
     }
 
     /// Runs frames until the app has nothing left to animate.
@@ -286,6 +351,44 @@ impl Bridge {
         self.settle();
     }
 
+    /// Where a clip's header is, and where it must be dragged to start at a time.
+    fn move_points(&self, name: &str, seconds: f64) -> Result<(Pos2, Pos2), String> {
+        let from = self.header_point(name)?;
+        let app = self.harness.state();
+        let clip = app.document().project().clips().iter().find(|c| c.name == name);
+        let start = clip.map_or(0.0, |c| c.start as f64);
+        let frames = seconds * self.sample_rate() - start;
+        let points = frames / app.timeline().view().frames_per_point;
+        Ok((from, from + vec2(points as f32, 0.0)))
+    }
+
+    fn header_point(&self, name: &str) -> Result<Pos2, String> {
+        let app = self.harness.state();
+        let clip = app
+            .document()
+            .project()
+            .clips()
+            .iter()
+            .find(|clip| clip.name == name)
+            .ok_or_else(|| format!("no clip named '{name}'"))?;
+        app.timeline()
+            .clip_header_point(clip)
+            .ok_or_else(|| format!("clip '{name}' is not on screen"))
+    }
+
+    fn secondary_click(&mut self, pos: Pos2) {
+        self.harness.hover_at(pos);
+        for pressed in [true, false] {
+            self.harness.event(egui::Event::PointerButton {
+                pos,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+        }
+        self.settle();
+    }
+
     fn sample_rate(&self) -> f64 {
         self.harness.state().document().project().sample_rate() as f64
     }
@@ -325,7 +428,7 @@ impl Bridge {
                 self.wait_for_import()?;
             }
             Command::Button(label) => {
-                match self.harness.query_by_label(&label) {
+                match self.harness.query_by_label(&label).or_else(|| self.harness.query_by_label_contains(&label)) {
                     Some(button) => button.click(),
                     None => return Err(format!("no button labelled '{label}'")),
                 }
@@ -336,19 +439,54 @@ impl Bridge {
                 self.settle();
             }
             Command::Clip(name, modifiers) => {
-                let app = self.harness.state();
-                let clip = app
-                    .document()
-                    .project()
-                    .clips()
-                    .iter()
-                    .find(|clip| clip.name == name)
-                    .ok_or_else(|| format!("no clip named '{name}'"))?;
-                let point = app
-                    .timeline()
-                    .clip_header_point(clip)
-                    .ok_or_else(|| format!("clip '{name}' is not on screen"))?;
+                let point = self.header_point(&name)?;
                 self.click(point, modifiers);
+            }
+            Command::Double(name) => {
+                let point = self.header_point(&name)?;
+                self.harness.hover_at(point);
+                for _ in 0..2 {
+                    self.press(point, true, Modifiers::NONE);
+                    self.press(point, false, Modifiers::NONE);
+                }
+                self.settle();
+            }
+            Command::MenuClip(name) => {
+                let point = self.header_point(&name)?;
+                self.secondary_click(point);
+            }
+            Command::MenuTime(seconds) => {
+                let point = self.point_at_time(seconds)?;
+                self.secondary_click(point);
+            }
+            Command::Move(name, seconds) => {
+                let (from, to) = self.move_points(&name, seconds)?;
+                self.drag(from, to, Modifiers::NONE);
+            }
+            Command::MoveHold(name, seconds) => {
+                let (from, to) = self.move_points(&name, seconds)?;
+                self.harness.hover_at(from);
+                self.press(from, true, Modifiers::NONE);
+                for step in 1..=8 {
+                    self.harness.hover_at(from.lerp(to, step as f32 / 8.0));
+                }
+                self.settle();
+                self.held = Some(to);
+            }
+            Command::Release => {
+                let at = self.held.take().ok_or("nothing is being held")?;
+                self.press(at, false, Modifiers::NONE);
+                self.settle();
+            }
+            Command::Type(text) => {
+                self.harness.event(egui::Event::Text(text));
+                self.settle();
+            }
+            Command::AmplifyDb(db) => {
+                if !self.harness.state_mut().set_amplify_db(db) {
+                    return Err("the amplify window isn't open".to_owned());
+                }
+                self.settle();
             }
             Command::Time(seconds, modifiers) => {
                 let point = self.point_at_time(seconds)?;
@@ -395,6 +533,83 @@ impl Bridge {
                 // Playing repaints constantly, so run frames rather than settling.
                 self.harness.run_steps(3);
             }
+            Command::RecordFeed(seconds, level) => {
+                let frames = (seconds * 44100.0) as usize;
+                self.harness.state().recorder().feed(vec![level; frames]);
+                self.harness.run_steps(3);
+            }
+            Command::RecordWait => {
+                let started = Instant::now();
+                self.harness.step();
+                while self.harness.state().recorder().is_finishing() {
+                    if started.elapsed() > IMPORT_TIMEOUT {
+                        return Err("timed out waiting for the take".to_owned());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    self.harness.step();
+                }
+                self.settle();
+            }
+            Command::Sleep(ms) => std::thread::sleep(Duration::from_millis(ms)),
+            Command::MenuButton(label) => {
+                let center = self
+                    .harness
+                    .query_by_label(&label)
+                    .ok_or_else(|| format!("no button labelled '{label}'"))?
+                    .rect()
+                    .center();
+                self.secondary_click(center);
+            }
+            Command::Silence(threshold_db, min_silence_seconds) => {
+                self.harness.state_mut().set_silence(kantan_audio_manager::SilenceSettings {
+                    threshold_db,
+                    min_silence_seconds,
+                });
+                self.settle();
+            }
+            Command::ExpectTip(label, text) => {
+                let center = self
+                    .harness
+                    .query_by_label(&label)
+                    .ok_or_else(|| format!("no control labelled '{label}'"))?
+                    .rect()
+                    .center();
+                self.harness.hover_at(center);
+                // Tooltips wait a moment before appearing.
+                self.harness.run_steps(90);
+                if self.harness.query_all_by_label_contains(&text).next().is_none() {
+                    return Err(format!("hovering '{label}' showed no tooltip with '{text}'"));
+                }
+            }
+            Command::ExpectText(text) => {
+                if self.harness.query_all_by_label_contains(&text).next().is_none() {
+                    return Err(format!("the window doesn't show '{text}'"));
+                }
+            }
+            Command::ImportWait => self.wait_for_import()?,
+            Command::Save(path) => {
+                if !self.harness.state_mut().save_to(path) {
+                    return Err("the save failed".to_owned());
+                }
+                self.settle();
+            }
+            Command::Open(path) => {
+                self.harness.state_mut().request_open(path);
+                self.settle();
+            }
+            Command::Close => {
+                self.harness.state_mut().request_close();
+                self.settle();
+            }
+            Command::AutosaveNow => {
+                let done = self
+                    .harness
+                    .state_mut()
+                    .autosave_now()
+                    .ok_or("autosave needs KANTAN_DATA_DIR to be set")?;
+                done.recv_timeout(IMPORT_TIMEOUT).map_err(|e| e.to_string())?;
+            }
+            Command::Crash => std::process::exit(101),
             Command::State => println!("{}", self.state()),
             Command::Screenshot(path) => {
                 let image = self.harness.render()?;
@@ -416,6 +631,9 @@ impl Bridge {
             ("prefix", _) => s.names.prefix = value.to_owned(),
             ("suffix", _) => s.names.suffix = value.to_owned(),
             ("rate", _) => s.sample_rate = number(value)?,
+            ("format", "wav") => s.format = FileFormat::Wav,
+            ("format", "mp3") => s.format = FileFormat::Mp3,
+            ("format", "ogg") => s.format = FileFormat::Ogg,
             ("bits", "16") => s.depth = BitDepth::Bits16,
             ("bits", "24") => s.depth = BitDepth::Bits24,
             ("scope", "all") => s.only_selected = false,
@@ -484,7 +702,27 @@ impl Bridge {
             json!({ "written": r.written, "failed": r.failed, "clipped": r.clipped })
         });
 
+        let (dialog_name, amplify_db, amplify_peak) = app.dialog_state();
+        let (auto_split, silence) = app.silence_state();
         json!({
+            "silence": {
+                "on": auto_split,
+                "db": silence.threshold_db,
+                "seconds": silence.min_silence_seconds,
+            },
+            "about_open": app.about_is_open(),
+            "project": {
+                "path": app.project_path(),
+                "dirty": app.is_dirty(),
+                "prompt": app.prompt_name(),
+                "closing": app.is_closing(),
+                "title": app.window_title(),
+            },
+            "recording": {
+                "active": app.recorder().is_recording(),
+                "finishing": app.recorder().is_finishing(),
+            },
+            "dialog": { "open": dialog_name, "db": amplify_db, "peak": amplify_peak },
             "playback": {
                 "playing": app.player().is_playing(),
                 "position": app.player().position().map(seconds),

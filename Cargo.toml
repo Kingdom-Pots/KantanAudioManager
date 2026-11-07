@@ -1,8 +1,9 @@
 [package]
 name = "kantan-audio-manager"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 description = "Lightweight single-track audio editor for batch exporting voicelines"
+license = "MIT"
 default-run = "kantan-audio-manager"
 
 [features]
@@ -25,7 +26,19 @@ egui_system_font_provider = { version = "0.37", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 serde_json = { version = "1", optional = true }
 symphonia = { version = "0.6", features = ["wav", "pcm", "mp3", "flac", "ogg", "vorbis"] }
+mp3lame-encoder = "0.3.0"
+vorbis_rs = "0.5.6"
+egui-pop-phosphor = "0.15.0"
+
+# Small, fast single executable for release.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 # Decoding and resampling are unusably slow without optimized dependencies.
 [profile.dev.package."*"]
 opt-level = 2
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

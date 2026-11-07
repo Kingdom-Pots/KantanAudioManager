@@ -14,7 +14,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Kantan Audio Manager")
             .with_inner_size([1100.0, 420.0])
-            .with_min_inner_size([500.0, 240.0]),
+            .with_min_inner_size([840.0, 420.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/logo/exports/kantan_256.png"))
+                    .expect("the embedded icon is a valid PNG"),
+            ),
         ..Default::default()
     };
 

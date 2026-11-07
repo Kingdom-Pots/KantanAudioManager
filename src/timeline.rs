@@ -1,9 +1,12 @@
 //! The track view: ruler, clips with waveforms, selection and zoom.
 
 use eframe::egui::{
+    self,
     Align2, Color32, CornerRadius, FontId, Modifiers, Painter, Pos2, Rect, Response, Sense,
     Stroke, StrokeKind, Ui, pos2, vec2,
 };
+
+use egui_phosphor::regular as icons;
 
 use crate::peaks::clip_min_max;
 use crate::{Clip, ClipId, Frames, Project, TimeRange};
@@ -15,6 +18,8 @@ const LANE_MARGIN: f32 = 8.0;
 /// Closest zoom: each frame is 16 points wide.
 const MIN_FRAMES_PER_POINT: f64 = 1.0 / 16.0;
 const MIN_TICK_SPACING: f64 = 90.0;
+const GHOST_OPACITY: f32 = 0.65;
+const DRAGGED_ORIGINAL_OPACITY: f32 = 0.35;
 
 const BACKGROUND: Color32 = Color32::from_rgb(24, 26, 30);
 const RULER: Color32 = Color32::from_rgb(34, 37, 43);
@@ -23,6 +28,7 @@ const LABEL: Color32 = Color32::from_rgb(170, 176, 186);
 const CLIP_BODY: Color32 = Color32::from_rgb(38, 46, 58);
 const CLIP_HEADER: Color32 = Color32::from_rgb(58, 70, 88);
 const CLIP_HEADER_SELECTED: Color32 = Color32::from_rgb(52, 120, 200);
+const CLIP_EDGE: Color32 = Color32::from_rgb(135, 150, 172);
 const CLIP_BORDER_SELECTED: Color32 = Color32::from_rgb(110, 175, 245);
 const WAVEFORM: Color32 = Color32::from_rgb(120, 190, 235);
 const WAVEFORM_OVER: Color32 = Color32::from_rgb(235, 90, 80);
@@ -186,9 +192,24 @@ fn tick_step(frames_per_point: f64, sample_rate: u32) -> f64 {
     seconds * sample_rate as f64
 }
 
+/// Something the user asked for on the track, for the app to carry out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TimelineAction {
+    Move(ClipId, Frames),
+    Rename(ClipId),
+    Split(Frames),
+    Merge,
+    Amplify,
+    Delete,
+    Export,
+    SplitOnSilence,
+}
+
+#[derive(Clone, Copy)]
 enum Drag {
     None,
     Range { start: Frames },
+    Clip { id: ClipId, grab: Frames, start: Frames },
     Scrollbar { grab: f64 },
 }
 
@@ -229,6 +250,9 @@ pub struct Timeline {
     extent: f64,
     /// Screen area from the last frame.
     rect: Rect,
+    action: Option<TimelineAction>,
+    /// Where the right-click menu was opened.
+    menu_frame: Frames,
 }
 
 impl Default for Timeline {
@@ -240,11 +264,18 @@ impl Default for Timeline {
             width: 1.0,
             extent: 1.0,
             rect: Rect::NOTHING,
+            action: None,
+            menu_frame: 0,
         }
     }
 }
 
 impl Timeline {
+    /// Abandons a drag in progress, returning whether there was one.
+    pub fn cancel_drag(&mut self) -> bool {
+        !matches!(std::mem::replace(&mut self.drag, Drag::None), Drag::None)
+    }
+
     pub fn view(&self) -> View {
         self.view
     }
@@ -291,7 +322,7 @@ impl Timeline {
         project: &Project,
         selection: &mut Selection,
         playhead: Option<Frames>,
-    ) {
+    ) -> Option<TimelineAction> {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let areas = Areas::new(rect);
         self.rect = rect;
@@ -304,6 +335,11 @@ impl Timeline {
         self.handle_zoom_and_scroll(ui, &response, &areas);
         self.view.clamp(self.width, self.extent);
         self.handle_pointer(ui, &response, &areas, project, selection);
+        self.context_menu(&response, project, selection);
+        let hint = self.hover_hint(&response, &areas, project);
+        if let Some(hint) = hint {
+            response.clone().on_hover_text_at_pointer(hint);
+        }
         if let Some(playhead) = playhead {
             self.follow(playhead as f64);
         }
@@ -311,8 +347,17 @@ impl Timeline {
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
+        let dragged = match self.drag {
+            Drag::Clip { id, .. } => Some(id),
+            _ => None,
+        };
         for clip in project.clips() {
-            self.paint_clip(&painter, &areas, project, clip, selection.clips.contains(&clip.id));
+            // The original stays dimmed in place while its ghost is dragged.
+            let mut clip_painter = painter.clone();
+            if dragged == Some(clip.id) {
+                clip_painter.set_opacity(DRAGGED_ORIGINAL_OPACITY);
+            }
+            self.paint_clip(&clip_painter, &areas, project, clip, selection.clips.contains(&clip.id));
         }
         self.paint_selection(&painter, &areas, selection);
         self.paint_ruler(&painter, &areas, project.sample_rate());
@@ -324,6 +369,73 @@ impl Timeline {
             );
         }
         self.paint_scrollbar(&painter, &areas);
+        self.paint_clip_drag(&painter, &areas, project);
+        self.action.take()
+    }
+
+    /// Explains what the part of the track under the pointer does.
+    fn hover_hint(&self, response: &Response, areas: &Areas, project: &Project) -> Option<&'static str> {
+        if !matches!(self.drag, Drag::None) {
+            return None;
+        }
+        let pos = response.hover_pos()?;
+        if areas.scrollbar.contains(pos) {
+            Some("Drag to scroll along the track")
+        } else if areas.ruler.contains(pos) {
+            Some("Click to move the cursor here. Ctrl+Scroll zooms.")
+        } else if self.clip_header_at(areas, project, pos).is_some() {
+            Some("Click to select, Ctrl or Shift+click for more. Drag to move. Double-click to rename. Right-click for more.")
+        } else {
+            Some("Click to place the cursor. Drag to select a range. Right-click for more.")
+        }
+    }
+
+    fn context_menu(&mut self, response: &Response, project: &Project, selection: &Selection) {
+        let frame = self.menu_frame;
+        let mut action = None;
+        response.context_menu(|ui| {
+            let inside = project.clips().iter().any(|c| frame > c.start && frame < c.end());
+            let single = match selection.clips.as_slice() {
+                [id] => Some(*id),
+                _ => None,
+            };
+            let has_target = selection.range.is_some() || !selection.clips.is_empty();
+            let mut item = |ui: &mut Ui, enabled: bool, icon: &str, label: &str, key: &str, tip: &str, chosen: TimelineAction| {
+                let button = egui::Button::new(format!("{icon}  {label}")).shortcut_text(key);
+                if ui.add_enabled(enabled, button).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+                    action = Some(chosen);
+                    ui.close();
+                }
+            };
+            item(ui, inside, icons::SCISSORS, "Split here", "Ctrl+I", "Cut the clip in two at this point. Right-click inside a clip to use it.", TimelineAction::Split(frame));
+            item(ui, selection.clips.len() >= 2, icons::ARROWS_MERGE, "Merge", "Ctrl+J", "Join the selected clips into one. Select two or more side by side.", TimelineAction::Merge);
+            let rename = "Change the clip's name, which is also its exported filename. Select one clip.";
+            item(ui, single.is_some(), icons::PENCIL_SIMPLE, "Rename", "F2", rename, single.map_or(TimelineAction::Merge, TimelineAction::Rename));
+            item(ui, !selection.clips.is_empty(), icons::WAVEFORM, "Split at silences", "", "Cut the selected clips into one clip per line at pauses. Set what counts as a pause by right-clicking the Split on silence button.", TimelineAction::SplitOnSilence);
+            item(ui, has_target, icons::SPEAKER_HIGH, "Amplify", "Ctrl+L", "Make the selected clips or range louder or quieter.", TimelineAction::Amplify);
+            item(ui, has_target, icons::TRASH, "Delete", "Del", "Remove the selected clips or range. The space stays empty.", TimelineAction::Delete);
+            ui.separator();
+            item(ui, true, icons::EXPORT, "Export", "Ctrl+E", "Export clips to audio files.", TimelineAction::Export);
+        });
+        if action.is_some() {
+            self.action = action;
+        }
+    }
+
+    /// Draws a see-through copy of the dragged clip, following the pointer.
+    fn paint_clip_drag(&self, painter: &Painter, areas: &Areas, project: &Project) {
+        let Drag::Clip { id, start, .. } = self.drag else { return };
+        let Some(clip) = project.clip(id) else { return };
+        let moved = Clip { start, ..clip.clone() };
+        let mut ghost = painter.with_clip_rect(areas.lane);
+        ghost.set_opacity(GHOST_OPACITY);
+        self.paint_clip(&ghost, areas, project, &moved, true);
+        painter.with_clip_rect(areas.lane).rect_stroke(
+            areas.clip_rect(&self.view, &moved),
+            CornerRadius::same(3),
+            Stroke::new(1.5, CURSOR),
+            StrokeKind::Inside,
+        );
     }
 
     /// Turns the page when the playhead leaves the view.
@@ -364,9 +476,9 @@ impl Timeline {
             let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(areas.lane.center());
             self.drag = if areas.scrollbar.contains(origin) {
                 Drag::Scrollbar { grab: self.scrollbar_grab(areas, origin.x) }
-            } else if self.clip_header_at(areas, project, origin).is_some() {
-                // Dragging a header will move the clip once editing is in.
-                Drag::None
+            } else if let Some(clip) = self.clip_header_at(areas, project, origin) {
+                let grabbed = frame_at(&self.view, origin.x);
+                Drag::Clip { id: clip.id, grab: grabbed.saturating_sub(clip.start), start: clip.start }
             } else {
                 Drag::Range { start: frame_at(&self.view, origin.x) }
             };
@@ -390,11 +502,37 @@ impl Timeline {
                     selection.set_range(start, frame_at(&self.view, x));
                 }
                 Drag::Scrollbar { grab } => self.drag_scrollbar(areas, pointer.x, grab),
+                Drag::Clip { id, grab, .. } => {
+                    let start = frame_at(&self.view, pointer.x).saturating_sub(grab);
+                    self.drag = Drag::Clip { id, grab, start };
+                }
             }
         }
 
         if response.drag_stopped() {
+            if let Drag::Clip { id, start, .. } = self.drag {
+                self.action = Some(TimelineAction::Move(id, start));
+            }
             self.drag = Drag::None;
+        }
+
+        if response.secondary_clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            self.menu_frame = frame_at(&self.view, pointer.x);
+            // The menu acts on the selection, so a clip outside it joins by replacing it.
+            if let Some(clip) = self.clip_header_at(areas, project, pointer)
+                && !selection.clips.contains(&clip.id)
+            {
+                selection.click_clip(project, clip, Modifiers::NONE);
+            }
+        }
+
+        if response.double_clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+            && let Some(clip) = self.clip_header_at(areas, project, pointer)
+        {
+            self.action = Some(TimelineAction::Rename(clip.id));
         }
 
         if response.clicked() {
@@ -481,9 +619,13 @@ impl Timeline {
         let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), rect.max);
         self.paint_waveform(painter, areas, project, clip, body);
 
-        if selected {
-            painter.rect_stroke(rect, radius, Stroke::new(1.5, CLIP_BORDER_SELECTED), StrokeKind::Inside);
-        }
+        // A border on every clip keeps touching clips distinct, such as after a split.
+        let border = if selected {
+            Stroke::new(2.0, CLIP_BORDER_SELECTED)
+        } else {
+            Stroke::new(1.0, CLIP_EDGE)
+        };
+        painter.rect_stroke(rect, radius, border, StrokeKind::Inside);
     }
 
     fn paint_waveform(&self, painter: &Painter, areas: &Areas, project: &Project, clip: &Clip, body: Rect) {
@@ -510,11 +652,17 @@ impl Timeline {
             let over = lo < -1.0 || hi > 1.0;
             let top = center - hi.clamp(-1.0, 1.0) * half_height;
             let bottom = center - lo.clamp(-1.0, 1.0) * half_height;
-            // Quiet audio still draws at least a one point line.
-            let bottom = bottom.max(top + 1.0);
-            painter.line_segment(
-                [pos2(x as f32 + 0.5, top), pos2(x as f32 + 0.5, bottom)],
-                Stroke::new(1.0, if over { WAVEFORM_OVER } else { WAVEFORM }),
+            // Quiet or steady audio still draws a visible line, on whole pixels so it stays crisp.
+            let (top, bottom) = if bottom - top < 2.0 {
+                let middle = ((top + bottom) / 2.0).round();
+                (middle - 1.0, middle + 1.0)
+            } else {
+                (top, bottom)
+            };
+            painter.rect_filled(
+                Rect::from_min_max(pos2(x as f32, top), pos2(x as f32 + 1.0, bottom)),
+                CornerRadius::ZERO,
+                if over { WAVEFORM_OVER } else { WAVEFORM },
             );
         }
     }

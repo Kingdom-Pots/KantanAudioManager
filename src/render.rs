@@ -1,4 +1,4 @@
-use crate::project::{Clip, Project, SegmentKind};
+use crate::project::{Clip, Frames, Project, SegmentKind};
 
 /// A clip's final audio, interleaved. Values are not clamped, so they can
 /// exceed 1.0 after amplifying; output stages decide how to handle that.
@@ -28,17 +28,18 @@ pub fn render_clip(project: &Project, clip: &Clip) -> RenderedClip {
         .unwrap_or(1);
 
     let mut samples = Vec::with_capacity(clip.len() as usize * channels as usize);
-    for segment in &clip.segments {
+    for (index, segment) in clip.segments.iter().enumerate() {
         match segment.kind {
             SegmentKind::Silence => {
                 samples.resize(samples.len() + segment.len as usize * channels as usize, 0.0);
             }
-            SegmentKind::Audio { source, offset, gain } => {
+            SegmentKind::Audio { source, offset, .. } => {
                 let source = source_of(source);
                 let width = source.channels as usize;
                 let first = offset as usize * width;
                 let last = first + segment.len as usize * width;
-                for frame in source.samples[first..last].chunks_exact(width) {
+                for (local, frame) in source.samples[first..last].chunks_exact(width).enumerate() {
+                    let gain = clip.gain_at(index, local as Frames, project.sample_rate());
                     for channel in 0..channels as usize {
                         // A mono frame repeats its one value on every channel.
                         samples.push(frame[channel.min(width - 1)] * gain);
